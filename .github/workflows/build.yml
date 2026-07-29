@@ -33,15 +33,23 @@ jobs:
       - name: Let the SDK scaffold a fresh project
         run: pebble new-project /tmp/wristwars
 
-      - name: Look at what it generated
+      - name: Replace the scaffold source with ours
         run: |
-          echo "--- files ---"
-          find /tmp/wristwars -type f -not -path "*/node_modules/*"
-          echo "--- package.json ---"
-          cat /tmp/wristwars/package.json
+          rm -f /tmp/wristwars/src/c/*.c
+          cp src/c/main.c /tmp/wristwars/src/c/main.c
+          ls -la /tmp/wristwars/src/c/
 
-      - name: Drop our source into the scaffold
-        run: cp src/c/main.c /tmp/wristwars/src/c/main.c
+      - name: Point the project at Emery and name it
+        run: |
+          python3 - << 'PY'
+          import json
+          path = '/tmp/wristwars/package.json'
+          data = json.load(open(path))
+          data['pebble']['targetPlatforms'] = ['emery']
+          data['pebble']['displayName'] = 'WristWars'
+          json.dump(data, open(path, 'w'), indent=2)
+          print(open(path).read())
+          PY
 
       - name: Build
         working-directory: /tmp/wristwars
