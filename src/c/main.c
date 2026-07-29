@@ -1,7 +1,7 @@
 #include <pebble.h>
 
 // ===========================================================================
-//  WristWars - step 4: enemy AI, alternating turns
+//  WristWars - step 5: designed map, clearer display
 // ===========================================================================
 
 #define GRID_W    10
@@ -14,18 +14,22 @@
 // ---- Terrain --------------------------------------------------------------
 //   .  = plains      F = forest
 //   M  = mountain    w = water
+//
+// A diagonal water barrier splits the board, so you must commit to one of
+// two flanks. Tanks cannot cross it; artillery can shell over it. Mountains
+// sit beside each gap as foot-only high ground overlooking the crossing.
 
 static const char *MAP[GRID_H] = {
+  ".......F..",
   "..........",
-  "..FF......",
-  "..FF...MM.",
-  ".......MM.",
-  "...wwww...",
-  "...wwww...",
-  ".MM.......",
-  ".MM....FF.",
-  ".......FF.",
+  "....M.F...",
+  ".F.ww...F.",
+  "..Mwww...F",
+  "F...wwwM..",
+  ".F...ww.F.",
+  "...F.M....",
   "..........",
+  "..F.......",
 };
 
 typedef enum { T_PLAINS = 0, T_FOREST, T_MOUNTAIN, T_WATER } Terrain;
@@ -58,7 +62,7 @@ typedef enum { U_INFANTRY = 0, U_BAZOOKA, U_TANK, U_ARTILLERY } UnitType;
 static const char *UNIT_NAMES[]   = { "Infantry", "Bazooka", "Tank", "Artillery" };
 static const char *UNIT_LETTERS[] = { "I", "B", "T", "A" };
 static const int   UNIT_MOVE[]    = {  3,   2,   6,   2  };
-static const int   UNIT_VALUE[]   = {  1,   2,   3,   3  };   // how badly AI wants a kill
+static const int   UNIT_VALUE[]   = {  1,   2,   3,   3  };
 
 // Damage in HP at full attacker health against zero-defence terrain.
 // Rows = attacker, columns = defender.
@@ -74,7 +78,7 @@ typedef struct {
   uint8_t type;
   uint8_t team;   // 0 = you, 1 = enemy
   uint8_t x, y;
-  int8_t  hp;     // 1..10
+  int8_t  hp;
   bool    acted;
   bool    alive;
 } Unit;
@@ -261,8 +265,8 @@ static bool adjacent_to_enemy(int x, int y, int team) {
   return false;
 }
 
-// Offer only tiles you'd actually want: attack positions, cover,
-// the furthest tile in each direction, and staying put.
+// Offer only tiles worth wanting: firing positions, cover, the furthest
+// tile in each direction, and staying put.
 static void build_dests(int ui) {
   Unit *u = &s_units[ui];
   s_dest_count = 0;
@@ -381,8 +385,6 @@ static int nearest_foe_dist(int x, int y, int team) {
   return best;
 }
 
-// Greedy: try every reachable tile crossed with every possible shot,
-// score the outcome, take the best. No lookahead.
 static void ai_act(int ui) {
   Unit *u = &s_units[ui];
   int home_x = u->x, home_y = u->y;
@@ -400,7 +402,7 @@ static void ai_act(int ui) {
     }
   }
 
-  int best_score  = -1000000;
+  int best_score = -1000000;
   int best_x = home_x, best_y = home_y, best_target = -1;
 
   for (int t = 0; t < s_ai_tile_count; t++) {
@@ -413,7 +415,6 @@ static void ai_act(int ui) {
 
     int def_bonus = TERRAIN_DEF[terrain_at(x, y)] * 15;
 
-    // Shots available from here
     if (!(is_indirect(u->type) && moved)) {
       for (int i = 0; i < s_unit_count; i++) {
         if (!s_units[i].alive || s_units[i].team == u->team) continue;
@@ -425,12 +426,12 @@ static void ai_act(int ui) {
         int score = 1000 + dmg * 10 + def_bonus;
 
         if (dmg >= victim->hp) {
-          score += 300 + UNIT_VALUE[victim->type] * 60;   // a kill is worth a lot
+          score += 300 + UNIT_VALUE[victim->type] * 60;
         }
         if (can_counter(victim, u)) {
           int back = compute_damage(victim, u);
           score -= back * 12;
-          if (back >= u->hp) score -= 400;                // don't suicide
+          if (back >= u->hp) score -= 400;
         }
 
         if (score > best_score) {
@@ -442,7 +443,6 @@ static void ai_act(int ui) {
       }
     }
 
-    // Or just reposition. Scored far below any shot.
     int approach = -nearest_foe_dist(x, y, u->team) * 10 + def_bonus / 3;
     if (approach > best_score) {
       best_score = approach;
@@ -451,9 +451,6 @@ static void ai_act(int ui) {
       best_target = -1;
     }
   }
-
-  u->x = home_x;
-  u->y = home_y;
 
   u->x = best_x;
   u->y = best_y;
@@ -478,7 +475,6 @@ static void begin_player_turn(void) {
 
 static void ai_step(void *data) {
   s_ai_timer = NULL;
-
   if (s_phase != PHASE_ENEMY) return;
 
   int next = -1;
@@ -523,10 +519,42 @@ static void restart_game(void) {
 
 // ---- Drawing --------------------------------------------------------------
 
+// A symbol per terrain, so the map reads without relying on colour alone.
+static void draw_terrain_mark(GContext *ctx, Terrain ter, int px, int py) {
+  int mid = TILE / 2;
+
+  switch (ter) {
+    case T_FOREST:                      // canopy over a trunk
+      graphics_context_set_fill_color(ctx, GColorMayGreen);
+      graphics_fill_circle(ctx, GPoint(px + mid, py + mid - 2), 4);
+      graphics_context_set_fill_color(ctx, GColorBlack);
+      graphics_fill_rect(ctx, GRect(px + mid - 1, py + TILE - 7, 2, 4), 0, GCornerNone);
+      break;
+
+    case T_MOUNTAIN:                    // pale peak
+      graphics_context_set_stroke_color(ctx, GColorWhite);
+      graphics_context_set_stroke_width(ctx, 2);
+      graphics_draw_line(ctx, GPoint(px + 3, py + TILE - 4), GPoint(px + mid, py + 4));
+      graphics_draw_line(ctx, GPoint(px + mid, py + 4), GPoint(px + TILE - 4, py + TILE - 4));
+      graphics_context_set_stroke_width(ctx, 1);
+      break;
+
+    case T_WATER:                       // ripples
+      graphics_context_set_stroke_color(ctx, GColorCeleste);
+      graphics_draw_line(ctx, GPoint(px + 3, py + 6),  GPoint(px + TILE - 6, py + 6));
+      graphics_draw_line(ctx, GPoint(px + 5, py + 11), GPoint(px + TILE - 4, py + 11));
+      break;
+
+    default:
+      break;                            // plains stay bare, which is the point
+  }
+}
+
 static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
   Unit *u = &s_units[ui];
   int px = ox + u->x * TILE;
   int py = oy + u->y * TILE;
+  GRect box = GRect(px + 2, py + 2, TILE - 4, TILE - 4);
 
   GColor fill, ink;
   if (u->team == 0) {
@@ -538,7 +566,11 @@ static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
   }
 
   graphics_context_set_fill_color(ctx, fill);
-  graphics_fill_rect(ctx, GRect(px + 2, py + 2, TILE - 4, TILE - 4), 2, GCornersAll);
+  graphics_fill_rect(ctx, box, 3, GCornersAll);
+
+  // Black outline keeps white units visible on pale terrain.
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_draw_round_rect(ctx, box, 3);
 
   graphics_context_set_text_color(ctx, ink);
   graphics_draw_text(ctx, UNIT_LETTERS[u->type],
@@ -547,11 +579,11 @@ static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
                      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 
   if (u->hp < 10) {
-    int w = (TILE - 6) * u->hp / 10;
+    int w = (TILE - 8) * u->hp / 10;
     graphics_context_set_fill_color(ctx, GColorBlack);
-    graphics_fill_rect(ctx, GRect(px + 3, py + TILE - 5, TILE - 6, 2), 0, GCornerNone);
+    graphics_fill_rect(ctx, GRect(px + 4, py + TILE - 6, TILE - 8, 3), 0, GCornerNone);
     graphics_context_set_fill_color(ctx, GColorIcterine);
-    graphics_fill_rect(ctx, GRect(px + 3, py + TILE - 5, w, 2), 0, GCornerNone);
+    graphics_fill_rect(ctx, GRect(px + 4, py + TILE - 6, w, 3), 0, GCornerNone);
   }
 }
 
@@ -564,16 +596,23 @@ static void canvas_update(Layer *layer, GContext *ctx) {
   int ox = (bounds.size.w - (GRID_W * TILE)) / 2;
   int oy = 2;
 
+  // Terrain
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
-      GRect tile = GRect(ox + x * TILE, oy + y * TILE, TILE, TILE);
-      graphics_context_set_fill_color(ctx, terrain_color(terrain_at(x, y)));
-      graphics_fill_rect(ctx, tile, 0, GCornerNone);
+      int px = ox + x * TILE;
+      int py = oy + y * TILE;
+      Terrain ter = terrain_at(x, y);
+
+      graphics_context_set_fill_color(ctx, terrain_color(ter));
+      graphics_fill_rect(ctx, GRect(px, py, TILE, TILE), 0, GCornerNone);
+      draw_terrain_mark(ctx, ter, px, py);
+
       graphics_context_set_stroke_color(ctx, GColorBlack);
-      graphics_draw_rect(ctx, tile);
+      graphics_draw_rect(ctx, GRect(px, py, TILE, TILE));
     }
   }
 
+  // Where the selected unit could go
   if (s_phase == PHASE_MOVE) {
     graphics_context_set_fill_color(ctx, GColorBlack);
     for (int i = 0; i < s_dest_count; i++) {
@@ -586,6 +625,16 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     if (s_units[i].alive) draw_unit(ctx, i, ox, oy);
   }
 
+  // The unit currently issuing an order, so you never lose track of it
+  if (s_selected >= 0) {
+    graphics_context_set_stroke_color(ctx, GColorCyan);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_rect(ctx, GRect(ox + s_units[s_selected].x * TILE,
+                                  oy + s_units[s_selected].y * TILE, TILE, TILE));
+    graphics_context_set_stroke_width(ctx, 1);
+  }
+
+  // Cursor
   int cx = 0, cy = 0;
   bool show_cursor = true;
   if (s_phase == PHASE_MOVE && s_dest_count > 0) {
@@ -609,34 +658,56 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     graphics_context_set_stroke_width(ctx, 1);
   }
 
-  static char s_status[48];
+  // ---- Two-line readout ----
+  static char s_line1[40];
+  static char s_line2[40];
+
+  int top = oy + GRID_H * TILE;
+
   if (s_phase == PHASE_OVER) {
-    snprintf(s_status, sizeof(s_status), "%s - hold Sel",
-             s_winner == 0 ? "You win!" : "Defeated");
+    snprintf(s_line1, sizeof(s_line1), "%s", s_winner == 0 ? "You win!" : "Defeated");
+    snprintf(s_line2, sizeof(s_line2), "Hold Select to restart");
+
   } else if (s_phase == PHASE_ENEMY) {
-    snprintf(s_status, sizeof(s_status), "Enemy turn");
+    snprintf(s_line1, sizeof(s_line1), "Enemy turn");
+    snprintf(s_line2, sizeof(s_line2), "You %d  Enemy %d",
+             count_alive(0), count_alive(1));
+
   } else if (s_phase == PHASE_TARGET) {
     Unit *a = &s_units[s_selected];
     Unit *d = &s_units[s_targets[s_target]];
+    Terrain dt = terrain_at(d->x, d->y);
     int out  = compute_damage(a, d);
     int back = can_counter(d, a) ? compute_damage(d, a) : 0;
-    snprintf(s_status, sizeof(s_status), "%s -%d/-%d",
-             UNIT_NAMES[d->type], out, back);
+    snprintf(s_line1, sizeof(s_line1), "%s  -%d / -%d", UNIT_NAMES[d->type], out, back);
+    snprintf(s_line2, sizeof(s_line2), "on %s +%d%%",
+             TERRAIN_NAMES[dt], TERRAIN_DEF[dt] * 20);
+
   } else if (s_phase == PHASE_MOVE) {
-    snprintf(s_status, sizeof(s_status), "%s  %d/%d",
-             TERRAIN_NAMES[terrain_at(cx, cy)], s_dest + 1, s_dest_count);
+    Terrain ct = terrain_at(cx, cy);
+    snprintf(s_line1, sizeof(s_line1), "%s +%d%%",
+             TERRAIN_NAMES[ct], TERRAIN_DEF[ct] * 20);
+    snprintf(s_line2, sizeof(s_line2), "Option %d of %d", s_dest + 1, s_dest_count);
+
   } else {
     Unit *u = &s_units[s_browse];
-    snprintf(s_status, sizeof(s_status), "%s %d%s",
+    Terrain ut = terrain_at(u->x, u->y);
+    snprintf(s_line1, sizeof(s_line1), "%s %d%s",
              UNIT_NAMES[u->type], u->hp, u->acted ? " used" : "");
+    snprintf(s_line2, sizeof(s_line2), "%s +%d%%   %d v %d",
+             TERRAIN_NAMES[ut], TERRAIN_DEF[ut] * 20,
+             count_alive(0), count_alive(1));
   }
 
   graphics_context_set_text_color(ctx, GColorWhite);
-  graphics_draw_text(ctx, s_status,
-                     fonts_get_system_font(FONT_KEY_GOTHIC_18),
-                     GRect(0, oy + GRID_H * TILE + 1, bounds.size.w, 24),
-                     GTextOverflowModeTrailingEllipsis,
-                     GTextAlignmentCenter, NULL);
+  graphics_draw_text(ctx, s_line1, fonts_get_system_font(FONT_KEY_GOTHIC_18),
+                     GRect(0, top, bounds.size.w, 22),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+  graphics_context_set_text_color(ctx, GColorLightGray);
+  graphics_draw_text(ctx, s_line2, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(0, top + 21, bounds.size.w, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 }
 
 // ---- Buttons --------------------------------------------------------------
@@ -723,7 +794,7 @@ static void back_handler(ClickRecognizerRef r, void *context) {
     finish_action();
     layer_mark_dirty(s_canvas);
   } else if (s_phase == PHASE_ENEMY) {
-    return;                      // let the enemy finish
+    return;
   } else {
     window_stack_pop(true);
   }
