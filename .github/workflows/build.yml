@@ -1,0 +1,44 @@
+name: Build Pebble App
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install pebble-tool
+        run: |
+          uv tool install --force "pebble-tool==5.0.39" --python 3.13
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Skip the analytics prompt
+        run: |
+          mkdir -p $HOME/.pebble-sdk
+          touch $HOME/.pebble-sdk/NO_TRACKING
+
+      - name: Install the Pebble SDK
+        run: pebble sdk install latest
+
+      - name: Show SDK state
+        run: pebble sdk list
+
+      - name: Build
+        run: pebble build
+
+      - name: Upload the .pbw
+        uses: actions/upload-artifact@v4
+        with:
+          name: wristwars-pbw
+          path: build/*.pbw
+          if-no-files-found: error
