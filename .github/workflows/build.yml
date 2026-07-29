@@ -30,15 +30,26 @@ jobs:
       - name: Install the Pebble SDK
         run: pebble sdk install latest
 
-      - name: Show SDK state
-        run: pebble sdk list
+      - name: Let the SDK scaffold a fresh project
+        run: pebble new-project /tmp/wristwars
+
+      - name: Look at what it generated
+        run: |
+          echo "--- files ---"
+          find /tmp/wristwars -type f -not -path "*/node_modules/*"
+          echo "--- package.json ---"
+          cat /tmp/wristwars/package.json
+
+      - name: Drop our source into the scaffold
+        run: cp src/c/main.c /tmp/wristwars/src/c/main.c
 
       - name: Build
+        working-directory: /tmp/wristwars
         run: pebble build
 
       - name: Upload the .pbw
         uses: actions/upload-artifact@v4
         with:
           name: wristwars-pbw
-          path: build/*.pbw
+          path: /tmp/wristwars/build/*.pbw
           if-no-files-found: error
