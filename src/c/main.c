@@ -1,7 +1,7 @@
 #include <pebble.h>
 
 // ===========================================================================
-//  WristWars - step 2: units, selection, movement
+//  WristWars - step 3: combat, plus a pruned movement list
 // ===========================================================================
 
 #define GRID_W    10
@@ -11,7 +11,6 @@
 #define UNREACHABLE 255
 
 // ---- Terrain --------------------------------------------------------------
-// Edit these rows to redesign the map. Keep them all the same length.
 //   .  = plains      F = forest
 //   M  = mountain    w = water
 
@@ -28,17 +27,10 @@ static const char *MAP[GRID_H] = {
   "..........",
 };
 
-typedef enum {
-  T_PLAINS = 0,
-  T_FOREST,
-  T_MOUNTAIN,
-  T_WATER,
-} Terrain;
+typedef enum { T_PLAINS = 0, T_FOREST, T_MOUNTAIN, T_WATER } Terrain;
 
 static const char *TERRAIN_NAMES[] = { "Plains", "Forest", "Mtn", "Sea" };
-
-// Defence bonus in "steps" - each step will be 20% damage reduction later.
-static const int TERRAIN_DEF[] = { 0, 1, 2, 0 };
+static const int   TERRAIN_DEF[]   = { 0, 1, 2, 0 };   // each step = -20% damage
 
 static Terrain terrain_at(int x, int y) {
   switch (MAP[y][x]) {
@@ -60,28 +52,43 @@ static GColor terrain_color(Terrain t) {
 
 // ---- Units ----------------------------------------------------------------
 
-typedef enum {
-  U_INFANTRY = 0,
-  U_BAZOOKA,
-  U_TANK,
-  U_ARTILLERY,
-} UnitType;
+typedef enum { U_INFANTRY = 0, U_BAZOOKA, U_TANK, U_ARTILLERY } UnitType;
 
-static const char *UNIT_NAMES[]   = { "Inf", "Bazooka", "Tank", "Arty" };
+static const char *UNIT_NAMES[]   = { "Inf", "Bzka", "Tank", "Arty" };
 static const char *UNIT_LETTERS[] = { "I", "B", "T", "A" };
 static const int   UNIT_MOVE[]    = {  3,   2,   6,   2  };
+
+// Damage in HP at full attacker health against zero-defence terrain.
+// Rows = attacker, columns = defender.
+static const int DMG[4][4] = {
+  //        Inf  Bzka Tank Arty
+  /*Inf */ {  5,   5,   1,   6 },
+  /*Bzka*/ {  6,   5,   7,   7 },
+  /*Tank*/ {  7,   7,   5,   8 },
+  /*Arty*/ {  7,   7,   6,   7 },
+};
 
 typedef struct {
   uint8_t type;
   uint8_t team;   // 0 = you, 1 = enemy
   uint8_t x, y;
-  uint8_t hp;     // 1..10
-  bool    acted;  // already used this turn
+  int8_t  hp;     // 1..10
+  bool    acted;
   bool    alive;
 } Unit;
 
 static Unit    s_units[MAX_UNITS];
 static uint8_t s_unit_count = 0;
+
+static bool is_indirect(UnitType t) { return t == U_ARTILLERY; }
+static int  min_range(UnitType t)   { return is_indirect(t) ? 2 : 1; }
+static int  max_range(UnitType t)   { return is_indirect(t) ? 3 : 1; }
+
+static int abs_i(int v) { return v < 0 ? -v : v; }
+
+static int dist_between(const Unit *a, const Unit *b) {
+  return abs_i(a->x - b->x) + abs_i(a->y - b->y);
+}
 
 static void add_unit(UnitType type, int team, int x, int y) {
   if (s_unit_count >= MAX_UNITS) return;
@@ -97,13 +104,12 @@ static void add_unit(UnitType type, int team, int x, int y) {
 
 static void setup_units(void) {
   s_unit_count = 0;
-  // Your army, bottom-left
   add_unit(U_INFANTRY,  0, 0, 9);
   add_unit(U_INFANTRY,  0, 1, 9);
   add_unit(U_BAZOOKA,   0, 0, 8);
   add_unit(U_TANK,      0, 2, 8);
   add_unit(U_ARTILLERY, 0, 1, 7);
-  // Enemy army, top-right
+
   add_unit(U_INFANTRY,  1, 9, 0);
   add_unit(U_INFANTRY,  1, 8, 0);
   add_unit(U_BAZOOKA,   1, 9, 1);
@@ -118,26 +124,38 @@ static int unit_at(int x, int y) {
   return -1;
 }
 
+// ---- Combat maths ---------------------------------------------------------
+
+static int compute_damage(const Unit *att, const Unit *def) {
+  int base = DMG[att->type][def->type];
+  if (base <= 0) return 0;
+
+  int dmg = base * att->hp / 10;                       // weaker units hit softer
+  int d   = TERRAIN_DEF[terrain_at(def->x, def->y)];
+  dmg = dmg * (10 - 2 * d) / 10;                        // terrain soaks damage
+  if (dmg < 1) dmg = 1;
+  return dmg;
+}
+
+static bool can_counter(const Unit *def, const Unit *att) {
+  if (is_indirect(def->type)) return false;             // artillery never counters
+  if (is_indirect(att->type)) return false;             // and is never countered
+  return dist_between(def, att) <= max_range(def->type);
+}
+
 // ---- Movement -------------------------------------------------------------
 
-// Cost to enter a tile. -1 means impassable for this unit type.
 static int move_cost(UnitType type, Terrain ter) {
   switch (ter) {
-    case T_WATER:
-      return -1;
-    case T_MOUNTAIN:
-      // Only foot units climb.
-      return (type == U_INFANTRY || type == U_BAZOOKA) ? 3 : -1;
-    case T_FOREST:
-      return 2;
-    default:
-      return 1;
+    case T_WATER:    return -1;
+    case T_MOUNTAIN: return (type == U_INFANTRY || type == U_BAZOOKA) ? 3 : -1;
+    case T_FOREST:   return 2;
+    default:         return 1;
   }
 }
 
 static uint8_t s_cost[GRID_H][GRID_W];
 
-// Flood-fill outward from the unit, tracking cheapest cost to each tile.
 static void compute_reach(int ui) {
   Unit *u = &s_units[ui];
 
@@ -157,14 +175,12 @@ static void compute_reach(int ui) {
       for (int x = 0; x < GRID_W; x++) {
         if (s_cost[y][x] == UNREACHABLE) continue;
         for (int d = 0; d < 4; d++) {
-          int nx = x + dx[d];
-          int ny = y + dy[d];
+          int nx = x + dx[d], ny = y + dy[d];
           if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
 
           int c = move_cost(u->type, terrain_at(nx, ny));
           if (c < 0) continue;
 
-          // Enemies block movement; friendlies can be passed through.
           int other = unit_at(nx, ny);
           if (other >= 0 && s_units[other].team != u->team) continue;
 
@@ -179,13 +195,28 @@ static void compute_reach(int ui) {
   }
 }
 
-typedef struct {
-  uint8_t x, y;
-  int16_t score;
-} Dest;
+typedef struct { uint8_t x, y; } Dest;
 
-static Dest    s_dests[GRID_W * GRID_H];
+static Dest    s_dests[64];
 static uint8_t s_dest_count = 0;
+
+static bool tile_free(int x, int y, int ui) {
+  int occ = unit_at(x, y);
+  return (occ < 0 || occ == ui);
+}
+
+static void push_dest(int x, int y, int ui) {
+  if (x < 0 || y < 0) return;
+  if (s_cost[y][x] == UNREACHABLE) return;
+  if (!tile_free(x, y, ui)) return;
+  for (int i = 0; i < s_dest_count; i++) {
+    if (s_dests[i].x == x && s_dests[i].y == y) return;   // already listed
+  }
+  if (s_dest_count >= 64) return;
+  s_dests[s_dest_count].x = x;
+  s_dests[s_dest_count].y = y;
+  s_dest_count++;
+}
 
 static bool adjacent_to_enemy(int x, int y, int team) {
   const int dx[4] = { 0, 0, -1, 1 };
@@ -197,65 +228,115 @@ static bool adjacent_to_enemy(int x, int y, int team) {
   return false;
 }
 
-// Build the destination list, best options first, so button-cycling is short.
+// Offer only tiles you'd actually want: attack positions, cover,
+// the furthest tile in each direction, and staying put.
 static void build_dests(int ui) {
   Unit *u = &s_units[ui];
   s_dest_count = 0;
 
-  for (int y = 0; y < GRID_H; y++) {
-    for (int x = 0; x < GRID_W; x++) {
-      if (s_cost[y][x] == UNREACHABLE) continue;
-
-      int occupant = unit_at(x, y);
-      if (occupant >= 0 && occupant != ui) continue;
-
-      Dest *d = &s_dests[s_dest_count++];
-      d->x = x;
-      d->y = y;
-      d->score = 0;
-      if (adjacent_to_enemy(x, y, u->team)) d->score += 100;
-      d->score += TERRAIN_DEF[terrain_at(x, y)] * 10;
-      d->score -= s_cost[y][x];
+  // 1. Places from which you can hit something.
+  if (is_indirect(u->type)) {
+    // Indirects can't move and fire, so only "stay put" is a firing position.
+  } else {
+    for (int y = 0; y < GRID_H; y++) {
+      for (int x = 0; x < GRID_W; x++) {
+        if (adjacent_to_enemy(x, y, u->team)) push_dest(x, y, ui);
+      }
     }
   }
 
-  // Insertion sort, highest score first.
-  for (int i = 1; i < s_dest_count; i++) {
-    Dest key = s_dests[i];
-    int j = i - 1;
-    while (j >= 0 && s_dests[j].score < key.score) {
-      s_dests[j + 1] = s_dests[j];
-      j--;
+  // 2. Cover.
+  for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_W; x++) {
+      if (TERRAIN_DEF[terrain_at(x, y)] > 0) push_dest(x, y, ui);
     }
-    s_dests[j + 1] = key;
+  }
+
+  // 3. As far as possible in each of eight directions.
+  const int ddx[8] = {  0,  1, 1, 1, 0, -1, -1, -1 };
+  const int ddy[8] = { -1, -1, 0, 1, 1,  1,  0, -1 };
+  for (int d = 0; d < 8; d++) {
+    int best_x = -1, best_y = -1, best_proj = -999, best_cost = -1;
+    for (int y = 0; y < GRID_H; y++) {
+      for (int x = 0; x < GRID_W; x++) {
+        if (s_cost[y][x] == UNREACHABLE) continue;
+        if (!tile_free(x, y, ui)) continue;
+        int proj = (x - u->x) * ddx[d] + (y - u->y) * ddy[d];
+        int cost = s_cost[y][x];
+        if (proj > best_proj || (proj == best_proj && cost > best_cost)) {
+          best_proj = proj;
+          best_cost = cost;
+          best_x = x;
+          best_y = y;
+        }
+      }
+    }
+    if (best_x >= 0 && best_proj > 0) push_dest(best_x, best_y, ui);
+  }
+
+  // 4. Stay put, always last.
+  push_dest(u->x, u->y, ui);
+}
+
+// ---- Targets --------------------------------------------------------------
+
+static int     s_targets[MAX_UNITS];
+static uint8_t s_target_count = 0;
+
+static void build_targets(int ui, bool moved) {
+  Unit *u = &s_units[ui];
+  s_target_count = 0;
+
+  if (is_indirect(u->type) && moved) return;   // artillery must hold still to fire
+
+  for (int i = 0; i < s_unit_count; i++) {
+    if (!s_units[i].alive || s_units[i].team == u->team) continue;
+    int d = dist_between(u, &s_units[i]);
+    if (d >= min_range(u->type) && d <= max_range(u->type)) {
+      s_targets[s_target_count++] = i;
+    }
   }
 }
 
 // ---- Game state -----------------------------------------------------------
 
-typedef enum {
-  PHASE_BROWSE = 0,   // cycling through your units
-  PHASE_MOVE,         // cycling through destinations
-} Phase;
+typedef enum { PHASE_BROWSE = 0, PHASE_MOVE, PHASE_TARGET, PHASE_OVER } Phase;
 
 static Window *s_window;
 static Layer  *s_canvas;
 
-static Phase   s_phase = PHASE_BROWSE;
-static int     s_browse = 0;      // index into s_units
-static int     s_dest = 0;        // index into s_dests
-static int     s_selected = -1;   // unit being moved
-static int     s_turn = 1;
+static Phase s_phase    = PHASE_BROWSE;
+static int   s_browse   = 0;
+static int   s_dest     = 0;
+static int   s_target   = 0;
+static int   s_selected = -1;
+static int   s_turn     = 1;
+static bool  s_moved    = false;
+static int   s_winner   = -1;
 
-static void select_first_own_unit(void) {
+static int count_alive(int team) {
+  int n = 0;
+  for (int i = 0; i < s_unit_count; i++) {
+    if (s_units[i].alive && s_units[i].team == team) n++;
+  }
+  return n;
+}
+
+static void check_game_over(void) {
+  if (count_alive(1) == 0)      { s_winner = 0; s_phase = PHASE_OVER; }
+  else if (count_alive(0) == 0) { s_winner = 1; s_phase = PHASE_OVER; }
+}
+
+static void snap_browse_to_own(void) {
   for (int i = 0; i < s_unit_count; i++) {
     if (s_units[i].alive && s_units[i].team == 0) { s_browse = i; return; }
   }
 }
 
 static void cycle_own_unit(int dir) {
+  if (count_alive(0) == 0) return;
   for (int step = 1; step <= s_unit_count; step++) {
-    int i = (s_browse + dir * step + s_unit_count * 4) % s_unit_count;
+    int i = (s_browse + dir * step + s_unit_count * 8) % s_unit_count;
     if (s_units[i].alive && s_units[i].team == 0) { s_browse = i; return; }
   }
 }
@@ -265,17 +346,46 @@ static void end_turn(void) {
   s_turn++;
   s_phase = PHASE_BROWSE;
   s_selected = -1;
-  select_first_own_unit();
+  snap_browse_to_own();
+}
+
+static void resolve_attack(int ai, int di) {
+  Unit *a = &s_units[ai];
+  Unit *d = &s_units[di];
+
+  int dmg = compute_damage(a, d);
+  d->hp -= dmg;
+  if (d->hp <= 0) {
+    d->hp = 0;
+    d->alive = false;
+    return;
+  }
+
+  if (can_counter(d, a)) {
+    int back = compute_damage(d, a);
+    a->hp -= back;
+    if (a->hp <= 0) { a->hp = 0; a->alive = false; }
+  }
+}
+
+static void restart_game(void) {
+  setup_units();
+  s_turn = 1;
+  s_winner = -1;
+  s_selected = -1;
+  s_moved = false;
+  s_phase = PHASE_BROWSE;
+  snap_browse_to_own();
 }
 
 // ---- Drawing --------------------------------------------------------------
 
 static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
   Unit *u = &s_units[ui];
-  GRect box = GRect(ox + u->x * TILE + 2, oy + u->y * TILE + 2, TILE - 4, TILE - 4);
+  int px = ox + u->x * TILE;
+  int py = oy + u->y * TILE;
 
-  GColor fill;
-  GColor ink;
+  GColor fill, ink;
   if (u->team == 0) {
     fill = u->acted ? GColorLightGray : GColorWhite;
     ink  = GColorBlack;
@@ -285,13 +395,22 @@ static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
   }
 
   graphics_context_set_fill_color(ctx, fill);
-  graphics_fill_rect(ctx, box, 2, GCornersAll);
+  graphics_fill_rect(ctx, GRect(px + 2, py + 2, TILE - 4, TILE - 4), 2, GCornersAll);
 
   graphics_context_set_text_color(ctx, ink);
   graphics_draw_text(ctx, UNIT_LETTERS[u->type],
                      fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                     GRect(ox + u->x * TILE, oy + u->y * TILE - 1, TILE, TILE),
+                     GRect(px, py - 2, TILE, TILE),
                      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+  // Health bar along the bottom of the unit, only when hurt.
+  if (u->hp < 10) {
+    int w = (TILE - 6) * u->hp / 10;
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_rect(ctx, GRect(px + 3, py + TILE - 5, TILE - 6, 2), 0, GCornerNone);
+    graphics_context_set_fill_color(ctx, GColorIcterine);
+    graphics_fill_rect(ctx, GRect(px + 3, py + TILE - 5, w, 2), 0, GCornerNone);
+  }
 }
 
 static void canvas_update(Layer *layer, GContext *ctx) {
@@ -303,7 +422,6 @@ static void canvas_update(Layer *layer, GContext *ctx) {
   int ox = (bounds.size.w - (GRID_W * TILE)) / 2;
   int oy = 2;
 
-  // Terrain
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
       GRect tile = GRect(ox + x * TILE, oy + y * TILE, TILE, TILE);
@@ -314,47 +432,61 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     }
   }
 
-  // Reachable tiles, while moving
   if (s_phase == PHASE_MOVE) {
     graphics_context_set_fill_color(ctx, GColorBlack);
     for (int i = 0; i < s_dest_count; i++) {
-      graphics_fill_circle(ctx,
-                           GPoint(ox + s_dests[i].x * TILE + TILE / 2,
-                                  oy + s_dests[i].y * TILE + TILE / 2),
-                           2);
+      graphics_fill_circle(ctx, GPoint(ox + s_dests[i].x * TILE + TILE / 2,
+                                       oy + s_dests[i].y * TILE + TILE / 2), 2);
     }
   }
 
-  // Units
   for (int i = 0; i < s_unit_count; i++) {
     if (s_units[i].alive) draw_unit(ctx, i, ox, oy);
   }
 
   // Cursor
-  int cx, cy;
+  int cx = 0, cy = 0;
+  bool show_cursor = true;
   if (s_phase == PHASE_MOVE && s_dest_count > 0) {
     cx = s_dests[s_dest].x;
     cy = s_dests[s_dest].y;
+  } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
+    cx = s_units[s_targets[s_target]].x;
+    cy = s_units[s_targets[s_target]].y;
+  } else if (s_phase == PHASE_OVER) {
+    show_cursor = false;
   } else {
     cx = s_units[s_browse].x;
     cy = s_units[s_browse].y;
   }
-  graphics_context_set_stroke_color(ctx, GColorYellow);
-  graphics_context_set_stroke_width(ctx, 3);
-  graphics_draw_rect(ctx, GRect(ox + cx * TILE, oy + cy * TILE, TILE, TILE));
-  graphics_context_set_stroke_width(ctx, 1);
+
+  if (show_cursor) {
+    graphics_context_set_stroke_color(ctx,
+        s_phase == PHASE_TARGET ? GColorRed : GColorYellow);
+    graphics_context_set_stroke_width(ctx, 3);
+    graphics_draw_rect(ctx, GRect(ox + cx * TILE, oy + cy * TILE, TILE, TILE));
+    graphics_context_set_stroke_width(ctx, 1);
+  }
 
   // Status line
-  static char s_status[40];
-  if (s_phase == PHASE_MOVE) {
+  static char s_status[48];
+  if (s_phase == PHASE_OVER) {
+    snprintf(s_status, sizeof(s_status), "%s - hold Sel",
+             s_winner == 0 ? "You win!" : "Defeated");
+  } else if (s_phase == PHASE_TARGET) {
+    Unit *a = &s_units[s_selected];
+    Unit *d = &s_units[s_targets[s_target]];
+    int out = compute_damage(a, d);
+    int back = can_counter(d, a) ? compute_damage(d, a) : 0;
+    snprintf(s_status, sizeof(s_status), "%s -%d  back -%d",
+             UNIT_NAMES[d->type], out, back);
+  } else if (s_phase == PHASE_MOVE) {
     snprintf(s_status, sizeof(s_status), "> %s  %d/%d",
-             TERRAIN_NAMES[terrain_at(cx, cy)],
-             s_dest + 1, s_dest_count);
+             TERRAIN_NAMES[terrain_at(cx, cy)], s_dest + 1, s_dest_count);
   } else {
     Unit *u = &s_units[s_browse];
     snprintf(s_status, sizeof(s_status), "%s %d  T%d%s",
-             UNIT_NAMES[u->type], u->hp, s_turn,
-             u->acted ? " used" : "");
+             UNIT_NAMES[u->type], u->hp, s_turn, u->acted ? " used" : "");
   }
 
   graphics_context_set_text_color(ctx, GColorWhite);
@@ -367,19 +499,31 @@ static void canvas_update(Layer *layer, GContext *ctx) {
 
 // ---- Buttons --------------------------------------------------------------
 
+static void finish_action(void) {
+  s_units[s_selected].acted = true;
+  s_selected = -1;
+  s_phase = PHASE_BROWSE;
+  snap_browse_to_own();
+  check_game_over();
+}
+
 static void up_handler(ClickRecognizerRef r, void *context) {
-  if (s_phase == PHASE_MOVE) {
-    if (s_dest_count > 0) s_dest = (s_dest + s_dest_count - 1) % s_dest_count;
-  } else {
+  if (s_phase == PHASE_MOVE && s_dest_count > 0) {
+    s_dest = (s_dest + s_dest_count - 1) % s_dest_count;
+  } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
+    s_target = (s_target + s_target_count - 1) % s_target_count;
+  } else if (s_phase == PHASE_BROWSE) {
     cycle_own_unit(-1);
   }
   layer_mark_dirty(s_canvas);
 }
 
 static void down_handler(ClickRecognizerRef r, void *context) {
-  if (s_phase == PHASE_MOVE) {
-    if (s_dest_count > 0) s_dest = (s_dest + 1) % s_dest_count;
-  } else {
+  if (s_phase == PHASE_MOVE && s_dest_count > 0) {
+    s_dest = (s_dest + 1) % s_dest_count;
+  } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
+    s_target = (s_target + 1) % s_target_count;
+  } else if (s_phase == PHASE_BROWSE) {
     cycle_own_unit(1);
   }
   layer_mark_dirty(s_canvas);
@@ -387,40 +531,59 @@ static void down_handler(ClickRecognizerRef r, void *context) {
 
 static void select_handler(ClickRecognizerRef r, void *context) {
   if (s_phase == PHASE_BROWSE) {
-    Unit *u = &s_units[s_browse];
-    if (u->acted) return;
+    if (s_units[s_browse].acted) return;
     s_selected = s_browse;
     compute_reach(s_selected);
     build_dests(s_selected);
     s_dest = 0;
     s_phase = PHASE_MOVE;
-  } else {
+
+  } else if (s_phase == PHASE_MOVE) {
+    Unit *u = &s_units[s_selected];
     if (s_dest_count > 0) {
-      Unit *u = &s_units[s_selected];
+      s_moved = (u->x != s_dests[s_dest].x || u->y != s_dests[s_dest].y);
       u->x = s_dests[s_dest].x;
       u->y = s_dests[s_dest].y;
-      u->acted = true;
+    } else {
+      s_moved = false;
     }
-    s_phase = PHASE_BROWSE;
-    s_selected = -1;
+    build_targets(s_selected, s_moved);
+    if (s_target_count > 0) {
+      s_target = 0;
+      s_phase = PHASE_TARGET;
+    } else {
+      finish_action();
+    }
+
+  } else if (s_phase == PHASE_TARGET) {
+    resolve_attack(s_selected, s_targets[s_target]);
+    finish_action();
+
+  } else if (s_phase == PHASE_OVER) {
+    return;   // restart is the long press
   }
   layer_mark_dirty(s_canvas);
 }
 
 static void select_long_handler(ClickRecognizerRef r, void *context) {
-  if (s_phase == PHASE_BROWSE) {
+  if (s_phase == PHASE_OVER) {
+    restart_game();
+  } else if (s_phase == PHASE_BROWSE) {
     end_turn();
-    layer_mark_dirty(s_canvas);
   }
+  layer_mark_dirty(s_canvas);
 }
 
 static void back_handler(ClickRecognizerRef r, void *context) {
   if (s_phase == PHASE_MOVE) {
-    s_phase = PHASE_BROWSE;
     s_selected = -1;
+    s_phase = PHASE_BROWSE;
+    layer_mark_dirty(s_canvas);
+  } else if (s_phase == PHASE_TARGET) {
+    finish_action();          // move without attacking
     layer_mark_dirty(s_canvas);
   } else {
-    window_stack_pop(true);   // leave the app
+    window_stack_pop(true);
   }
 }
 
@@ -446,8 +609,7 @@ static void window_unload(Window *window) {
 }
 
 static void init(void) {
-  setup_units();
-  select_first_own_unit();
+  restart_game();
 
   s_window = window_create();
   window_set_click_config_provider(s_window, click_config);
