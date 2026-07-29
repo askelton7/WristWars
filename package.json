@@ -1,0 +1,22 @@
+{
+  "name": "wristwars",
+  "author": "you",
+  "version": "1.0.0",
+  "private": true,
+  "keywords": [],
+  "dependencies": {},
+  "pebble": {
+    "displayName": "WristWars",
+    "uuid": "8f2a4c61-3d7e-4b19-9c05-6ae1f0d38b47",
+    "sdkVersion": "3",
+    "enableMultiJS": false,
+    "targetPlatforms": ["emery"],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": [],
+    "resources": {
+      "media": []
+    }
+  }
+}
