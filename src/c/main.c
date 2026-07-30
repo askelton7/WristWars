@@ -2,7 +2,7 @@
 #include <string.h>
 
 // ===========================================================================
-//  WristWars - step 7: vibration, auto-save, threat overlay
+//  WristWars - step 8: undo, turn counter, safety confirms, match summary
 // ===========================================================================
 
 #define GRID_W    10
@@ -13,7 +13,7 @@
 #define UNREACHABLE 255
 #define AI_STEP_MS  450
 
-#define SAVE_VERSION     2
+#define SAVE_VERSION     3
 #define PERSIST_KEY_SAVE 1
 
 // ---- Terrain --------------------------------------------------------------
@@ -85,6 +85,11 @@ typedef struct {
 static Unit    s_units[MAX_UNITS];
 static uint8_t s_unit_count = 0;
 
+// Match record, shown in the summary and carried in the save.
+static int s_turn        = 1;
+static int s_lost_player = 0;
+static int s_lost_enemy  = 0;
+
 static bool is_indirect(UnitType t) { return t == U_ARTILLERY; }
 static int  min_range(UnitType t)   { return is_indirect(t) ? 2 : 1; }
 static int  max_range(UnitType t)   { return is_indirect(t) ? 3 : 1; }
@@ -155,8 +160,15 @@ static bool can_counter(const Unit *def, const Unit *att) {
   return dist_between(def, att) <= max_range(def->type);
 }
 
-// One buzz at most per exchange: a double pulse if anything died, a short
-// pulse if one of your units merely took a hit.
+static void kill_unit(Unit *u) {
+  u->hp = 0;
+  u->alive = false;
+  if (u->team == 0) s_lost_player++;
+  else              s_lost_enemy++;
+}
+
+// One buzz at most per exchange: double pulse if anything died, short pulse
+// if one of your units merely took a hit.
 static void resolve_attack(int ai, int di) {
   Unit *a = &s_units[ai];
   Unit *d = &s_units[di];
@@ -165,13 +177,13 @@ static void resolve_attack(int ai, int di) {
   int dmg = compute_damage(a, d);
   d->hp -= dmg;
   if (d->team == 0) player_hurt = true;
-  if (d->hp <= 0) { d->hp = 0; d->alive = false; died = true; }
+  if (d->hp <= 0) { kill_unit(d); died = true; }
 
   if (!died && can_counter(d, a)) {
     int back = compute_damage(d, a);
     a->hp -= back;
     if (a->team == 0) player_hurt = true;
-    if (a->hp <= 0) { a->hp = 0; a->alive = false; died = true; }
+    if (a->hp <= 0) { kill_unit(a); died = true; }
   }
 
   if (died)             vibes_double_pulse();
@@ -250,9 +262,8 @@ static bool adjacent_to_enemy(int x, int y, int team) {
 }
 
 // ---- Threat map -----------------------------------------------------------
-// Every tile an enemy could attack on its next turn. Direct units threaten
-// the ring around anywhere they can move to; artillery cannot move and fire,
-// so it only threatens range 2-3 from where it already stands.
+// Direct units threaten the ring around anywhere they can move to. Artillery
+// cannot move and fire, so it only threatens range 2-3 from where it stands.
 
 static bool s_threat[GRID_H][GRID_W];
 static bool s_show_threat = false;
@@ -373,7 +384,6 @@ static int group_preview(int g) {
 }
 
 // Farthest first, so the cursor opens on the tile the heading preview showed.
-// Down then steps back toward the unit.
 static void build_dests_for_group(int g) {
   s_dest_count = 0;
   for (int i = 0; i < s_reach_count; i++) {
@@ -417,16 +427,34 @@ typedef enum {
   PHASE_TARGET, PHASE_ENEMY, PHASE_OVER,
 } Phase;
 
+typedef enum { CONFIRM_NONE = 0, CONFIRM_END_TURN, CONFIRM_NEW_GAME } Confirm;
+
 static Window   *s_window;
 static Layer    *s_canvas;
 static AppTimer *s_ai_timer = NULL;
 
-static Phase s_phase    = PHASE_BROWSE;
-static int   s_browse   = 0;
-static int   s_target   = 0;
-static int   s_selected = -1;
-static bool  s_moved    = false;
-static int   s_winner   = -1;
+static Phase   s_phase    = PHASE_BROWSE;
+static Confirm s_confirm  = CONFIRM_NONE;
+static int     s_browse   = 0;
+static int     s_target   = 0;
+static int     s_selected = -1;
+static bool    s_moved    = false;
+static int     s_winner   = -1;
+
+// One level of undo, valid only inside your own turn.
+static Unit s_undo_units[MAX_UNITS];
+static int  s_undo_browse = 0;
+static int  s_undo_lost_player = 0;
+static int  s_undo_lost_enemy  = 0;
+static bool s_undo_ok = false;
+
+static void snapshot_for_undo(void) {
+  memcpy(s_undo_units, s_units, sizeof(s_units));
+  s_undo_browse      = s_browse;
+  s_undo_lost_player = s_lost_player;
+  s_undo_lost_enemy  = s_lost_enemy;
+  s_undo_ok = true;
+}
 
 static void check_game_over(void) {
   if (count_alive(1) == 0)      { s_winner = 0; s_phase = PHASE_OVER; }
@@ -466,24 +494,31 @@ static void cycle_own_unit(int dir) {
 }
 
 // ---- Save / restore -------------------------------------------------------
-// Saved at the start of your turn and after each of your actions, so putting
-// your wrist down mid-turn costs nothing. Never saved mid enemy turn, so a
-// resume never lands inside a half-finished AI sequence.
 
 typedef struct {
-  uint8_t version;
-  uint8_t unit_count;
-  int8_t  winner;
-  uint8_t pad;
-  Unit    units[MAX_UNITS];
+  uint8_t  version;
+  uint8_t  unit_count;
+  int8_t   winner;
+  uint8_t  pad;
+  uint16_t turn;
+  uint8_t  lost_player;
+  uint8_t  lost_enemy;
+  Unit     units[MAX_UNITS];
 } SaveBlob;
 
+// Never write mid enemy turn, so a resume can't land inside a half-finished
+// AI sequence. The system can kill the app at any moment, including then.
 static void save_game(void) {
+  if (s_phase == PHASE_ENEMY) return;
+
   SaveBlob b;
   memset(&b, 0, sizeof(b));
-  b.version    = SAVE_VERSION;
-  b.unit_count = s_unit_count;
-  b.winner     = (int8_t)s_winner;
+  b.version     = SAVE_VERSION;
+  b.unit_count  = s_unit_count;
+  b.winner      = (int8_t)s_winner;
+  b.turn        = (uint16_t)s_turn;
+  b.lost_player = (uint8_t)s_lost_player;
+  b.lost_enemy  = (uint8_t)s_lost_enemy;
   memcpy(b.units, s_units, sizeof(s_units));
   persist_write_data(PERSIST_KEY_SAVE, &b, sizeof(b));
 }
@@ -497,9 +532,12 @@ static bool load_game(void) {
   if (b.version != SAVE_VERSION) return false;
   if (b.unit_count == 0 || b.unit_count > MAX_UNITS) return false;
 
-  s_unit_count = b.unit_count;
+  s_unit_count   = b.unit_count;
   memcpy(s_units, b.units, sizeof(s_units));
-  s_winner = b.winner;
+  s_winner       = b.winner;
+  s_turn         = b.turn > 0 ? b.turn : 1;
+  s_lost_player  = b.lost_player;
+  s_lost_enemy   = b.lost_enemy;
   return true;
 }
 
@@ -590,8 +628,11 @@ static void begin_player_turn(void) {
   for (int i = 0; i < s_unit_count; i++) {
     if (s_units[i].team == 0) s_units[i].acted = false;
   }
+  s_turn++;
   s_phase = PHASE_BROWSE;
   s_selected = -1;
+  s_confirm = CONFIRM_NONE;
+  s_undo_ok = false;               // can't undo across a turn boundary
   focus_next_unacted(s_unit_count - 1);
   recompute_threat();
   save_game();
@@ -608,6 +649,7 @@ static void ai_step(void *data) {
 
   if (next < 0) {
     begin_player_turn();
+    vibes_short_pulse();           // your move, in case you looked away
     layer_mark_dirty(s_canvas);
     return;
   }
@@ -625,6 +667,8 @@ static void begin_enemy_turn(void) {
     if (s_units[i].team == 1) s_units[i].acted = false;
   }
   s_selected = -1;
+  s_confirm = CONFIRM_NONE;
+  s_undo_ok = false;
   s_phase = PHASE_ENEMY;
   schedule_ai();
 }
@@ -632,9 +676,14 @@ static void begin_enemy_turn(void) {
 static void new_game(void) {
   if (s_ai_timer) { app_timer_cancel(s_ai_timer); s_ai_timer = NULL; }
   setup_units();
+  s_turn = 1;
+  s_lost_player = 0;
+  s_lost_enemy = 0;
   s_winner = -1;
   s_selected = -1;
   s_moved = false;
+  s_confirm = CONFIRM_NONE;
+  s_undo_ok = false;
   s_phase = PHASE_BROWSE;
   focus_next_unacted(s_unit_count - 1);
   recompute_threat();
@@ -722,7 +771,6 @@ static void canvas_update(Layer *layer, GContext *ctx) {
       graphics_fill_rect(ctx, GRect(px, py, TILE, TILE), 0, GCornerNone);
       draw_terrain_mark(ctx, ter, px, py);
 
-      // Threat corner flag
       if (s_show_threat && s_threat[y][x]) {
         graphics_context_set_fill_color(ctx, GColorRed);
         graphics_fill_rect(ctx, GRect(px + TILE - 6, py + 2, 4, 4), 0, GCornerNone);
@@ -787,17 +835,19 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     graphics_context_set_stroke_width(ctx, 1);
   }
 
-  static char s_line1[40];
-  static char s_line2[40];
+  static char s_line1[44];
+  static char s_line2[44];
   int top = oy + GRID_H * TILE;
 
   if (s_phase == PHASE_OVER) {
     snprintf(s_line1, sizeof(s_line1), "%s", s_winner == 0 ? "You win!" : "Defeated");
-    snprintf(s_line2, sizeof(s_line2), "Hold Select to restart");
+    snprintf(s_line2, sizeof(s_line2), "T%d  lost %d  killed %d",
+             s_turn, s_lost_player, s_lost_enemy);
 
   } else if (s_phase == PHASE_ENEMY) {
     snprintf(s_line1, sizeof(s_line1), "Enemy turn");
-    snprintf(s_line2, sizeof(s_line2), "You %d  Enemy %d", count_alive(0), count_alive(1));
+    snprintf(s_line2, sizeof(s_line2), "T%d   You %d  Enemy %d",
+             s_turn, count_alive(0), count_alive(1));
 
   } else if (s_phase == PHASE_TARGET) {
     Unit *a = &s_units[s_selected];
@@ -817,8 +867,7 @@ static void canvas_update(Layer *layer, GContext *ctx) {
   } else if (s_phase == PHASE_MOVE) {
     Terrain ct = terrain_at(cx, cy);
     snprintf(s_line1, sizeof(s_line1), "%s +%d%%%s",
-             TERRAIN_NAMES[ct], TERRAIN_DEF[ct] * 20,
-             s_threat[cy][cx] ? "  RISK" : "");
+             TERRAIN_NAMES[ct], TERRAIN_DEF[ct] * 20, s_threat[cy][cx] ? "  RISK" : "");
     snprintf(s_line2, sizeof(s_line2), "%d steps   %d of %d",
              s_cost[cy][cx], s_dest + 1, s_dest_count);
 
@@ -827,11 +876,17 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     Terrain ut = terrain_at(u->x, u->y);
     snprintf(s_line1, sizeof(s_line1), "%s %d%s",
              UNIT_NAMES[u->type], u->hp, u->acted ? " used" : "");
-    if (all_player_used()) {
-      snprintf(s_line2, sizeof(s_line2), "All used - hold Select");
+
+    if (s_confirm == CONFIRM_END_TURN) {
+      snprintf(s_line2, sizeof(s_line2), "Hold Select again to end");
+    } else if (s_confirm == CONFIRM_NEW_GAME) {
+      snprintf(s_line2, sizeof(s_line2), "Hold Back again: new game");
+    } else if (all_player_used()) {
+      snprintf(s_line2, sizeof(s_line2), "T%d  all used: hold Select", s_turn);
     } else {
-      snprintf(s_line2, sizeof(s_line2), "%s +%d%%   %d v %d",
-               TERRAIN_NAMES[ut], TERRAIN_DEF[ut] * 20, count_alive(0), count_alive(1));
+      snprintf(s_line2, sizeof(s_line2), "T%d  %s +%d%%   %d v %d",
+               s_turn, TERRAIN_NAMES[ut], TERRAIN_DEF[ut] * 20,
+               count_alive(0), count_alive(1));
     }
   }
 
@@ -840,7 +895,8 @@ static void canvas_update(Layer *layer, GContext *ctx) {
                      GRect(0, top, bounds.size.w, 22),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
-  graphics_context_set_text_color(ctx, GColorLightGray);
+  graphics_context_set_text_color(ctx,
+      s_confirm == CONFIRM_NONE ? GColorLightGray : GColorIcterine);
   graphics_draw_text(ctx, s_line2, fonts_get_system_font(FONT_KEY_GOTHIC_14),
                      GRect(0, top + 21, bounds.size.w, 18),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
@@ -860,6 +916,7 @@ static void finish_action(void) {
 }
 
 static void up_handler(ClickRecognizerRef r, void *context) {
+  s_confirm = CONFIRM_NONE;
   if (s_phase == PHASE_GROUP && s_group_count > 0) {
     s_group = (s_group + s_group_count - 1) % s_group_count;
   } else if (s_phase == PHASE_MOVE && s_dest_count > 0) {
@@ -873,6 +930,7 @@ static void up_handler(ClickRecognizerRef r, void *context) {
 }
 
 static void down_handler(ClickRecognizerRef r, void *context) {
+  s_confirm = CONFIRM_NONE;
   if (s_phase == PHASE_GROUP && s_group_count > 0) {
     s_group = (s_group + 1) % s_group_count;
   } else if (s_phase == PHASE_MOVE && s_dest_count > 0) {
@@ -885,16 +943,36 @@ static void down_handler(ClickRecognizerRef r, void *context) {
   layer_mark_dirty(s_canvas);
 }
 
-// Hold Up anywhere to flag every tile the enemy could hit next turn.
+// Hold Up anywhere: flag every tile the enemy could hit next turn.
 static void up_long_handler(ClickRecognizerRef r, void *context) {
   s_show_threat = !s_show_threat;
   if (s_show_threat) recompute_threat();
   layer_mark_dirty(s_canvas);
 }
 
+// Hold Down in browse: take back your last action.
+static void down_long_handler(ClickRecognizerRef r, void *context) {
+  if (s_phase != PHASE_BROWSE || !s_undo_ok) return;
+
+  memcpy(s_units, s_undo_units, sizeof(s_units));
+  s_browse       = s_undo_browse;
+  s_lost_player  = s_undo_lost_player;
+  s_lost_enemy   = s_undo_lost_enemy;
+  s_undo_ok      = false;
+  s_selected     = -1;
+  s_confirm      = CONFIRM_NONE;
+  recompute_threat();
+  save_game();
+  vibes_short_pulse();
+  layer_mark_dirty(s_canvas);
+}
+
 static void select_handler(ClickRecognizerRef r, void *context) {
+  s_confirm = CONFIRM_NONE;
+
   if (s_phase == PHASE_BROWSE) {
     if (s_units[s_browse].acted) return;
+    snapshot_for_undo();
     s_selected = s_browse;
     compute_reach(s_selected);
     classify_reach(s_selected);
@@ -930,36 +1008,46 @@ static void select_handler(ClickRecognizerRef r, void *context) {
 static void select_long_handler(ClickRecognizerRef r, void *context) {
   if (s_phase == PHASE_OVER) {
     new_game();
-    layer_mark_dirty(s_canvas);
   } else if (s_phase == PHASE_BROWSE) {
-    begin_enemy_turn();
-    layer_mark_dirty(s_canvas);
+    // Ending with units still to move needs a second hold.
+    if (!all_player_used() && s_confirm != CONFIRM_END_TURN) {
+      s_confirm = CONFIRM_END_TURN;
+    } else {
+      begin_enemy_turn();
+    }
   }
+  layer_mark_dirty(s_canvas);
 }
 
 static void back_handler(ClickRecognizerRef r, void *context) {
+  s_confirm = CONFIRM_NONE;
+
   if (s_phase == PHASE_GROUP) {
     s_selected = -1;
     s_phase = PHASE_BROWSE;
-    layer_mark_dirty(s_canvas);
   } else if (s_phase == PHASE_MOVE) {
     s_phase = PHASE_GROUP;
-    layer_mark_dirty(s_canvas);
   } else if (s_phase == PHASE_TARGET) {
     finish_action();
-    layer_mark_dirty(s_canvas);
   } else if (s_phase == PHASE_ENEMY) {
     return;
   } else {
     save_game();
     window_stack_pop(true);
+    return;
   }
+  layer_mark_dirty(s_canvas);
 }
 
-// Hold Back to abandon the saved match and start fresh.
+// Hold Back twice: abandon the saved match.
 static void back_long_handler(ClickRecognizerRef r, void *context) {
   if (s_phase == PHASE_ENEMY) return;
-  new_game();
+
+  if (s_confirm != CONFIRM_NEW_GAME) {
+    s_confirm = CONFIRM_NEW_GAME;
+  } else {
+    new_game();
+  }
   layer_mark_dirty(s_canvas);
 }
 
@@ -967,6 +1055,7 @@ static void click_config(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, up_handler);
   window_long_click_subscribe(BUTTON_ID_UP, 500, up_long_handler, NULL);
   window_single_click_subscribe(BUTTON_ID_DOWN, down_handler);
+  window_long_click_subscribe(BUTTON_ID_DOWN, 500, down_long_handler, NULL);
   window_single_click_subscribe(BUTTON_ID_SELECT, select_handler);
   window_long_click_subscribe(BUTTON_ID_SELECT, 500, select_long_handler, NULL);
   window_single_click_subscribe(BUTTON_ID_BACK, back_handler);
@@ -991,6 +1080,8 @@ static void init(void) {
   if (load_game()) {
     s_selected = -1;
     s_moved = false;
+    s_confirm = CONFIRM_NONE;
+    s_undo_ok = false;
     if (s_winner >= 0) {
       s_phase = PHASE_OVER;
       snap_browse_to_own();
