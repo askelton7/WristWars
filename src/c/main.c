@@ -1,7 +1,8 @@
 #include <pebble.h>
+#include <string.h>
 
 // ===========================================================================
-//  WristWars - step 6: two-stage movement, reliable unit advance
+//  WristWars - step 7: vibration, auto-save, threat overlay
 // ===========================================================================
 
 #define GRID_W    10
@@ -11,6 +12,9 @@
 #define MAX_REACH (GRID_W * GRID_H)
 #define UNREACHABLE 255
 #define AI_STEP_MS  450
+
+#define SAVE_VERSION     2
+#define PERSIST_KEY_SAVE 1
 
 // ---- Terrain --------------------------------------------------------------
 //   .  = plains      F = forest
@@ -151,19 +155,27 @@ static bool can_counter(const Unit *def, const Unit *att) {
   return dist_between(def, att) <= max_range(def->type);
 }
 
+// One buzz at most per exchange: a double pulse if anything died, a short
+// pulse if one of your units merely took a hit.
 static void resolve_attack(int ai, int di) {
   Unit *a = &s_units[ai];
   Unit *d = &s_units[di];
+  bool died = false, player_hurt = false;
 
   int dmg = compute_damage(a, d);
   d->hp -= dmg;
-  if (d->hp <= 0) { d->hp = 0; d->alive = false; return; }
+  if (d->team == 0) player_hurt = true;
+  if (d->hp <= 0) { d->hp = 0; d->alive = false; died = true; }
 
-  if (can_counter(d, a)) {
+  if (!died && can_counter(d, a)) {
     int back = compute_damage(d, a);
     a->hp -= back;
-    if (a->hp <= 0) { a->hp = 0; a->alive = false; }
+    if (a->team == 0) player_hurt = true;
+    if (a->hp <= 0) { a->hp = 0; a->alive = false; died = true; }
   }
+
+  if (died)             vibes_double_pulse();
+  else if (player_hurt) vibes_short_pulse();
 }
 
 // ---- Movement -------------------------------------------------------------
@@ -178,14 +190,15 @@ static int move_cost(UnitType type, Terrain ter) {
 }
 
 static uint8_t s_cost[GRID_H][GRID_W];
+static uint8_t s_scratch[GRID_H][GRID_W];   // threat maths, keeps s_cost intact
 
-static void compute_reach(int ui) {
+static void compute_reach_into(int ui, uint8_t out[GRID_H][GRID_W]) {
   Unit *u = &s_units[ui];
 
   for (int y = 0; y < GRID_H; y++) {
-    for (int x = 0; x < GRID_W; x++) s_cost[y][x] = UNREACHABLE;
+    for (int x = 0; x < GRID_W; x++) out[y][x] = UNREACHABLE;
   }
-  s_cost[u->y][u->x] = 0;
+  out[u->y][u->x] = 0;
 
   int budget = UNIT_MOVE[u->type];
   const int dx[4] = { 0, 0, -1, 1 };
@@ -196,7 +209,7 @@ static void compute_reach(int ui) {
     changed = false;
     for (int y = 0; y < GRID_H; y++) {
       for (int x = 0; x < GRID_W; x++) {
-        if (s_cost[y][x] == UNREACHABLE) continue;
+        if (out[y][x] == UNREACHABLE) continue;
         for (int d = 0; d < 4; d++) {
           int nx = x + dx[d], ny = y + dy[d];
           if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
@@ -204,15 +217,19 @@ static void compute_reach(int ui) {
           if (c < 0) continue;
           int other = unit_at(nx, ny);
           if (other >= 0 && s_units[other].team != u->team) continue;
-          int nc = s_cost[y][x] + c;
-          if (nc <= budget && nc < s_cost[ny][nx]) {
-            s_cost[ny][nx] = nc;
+          int nc = out[y][x] + c;
+          if (nc <= budget && nc < out[ny][nx]) {
+            out[ny][nx] = nc;
             changed = true;
           }
         }
       }
     }
   }
+}
+
+static void compute_reach(int ui) {
+  compute_reach_into(ui, s_cost);
 }
 
 typedef struct { uint8_t x, y; } Tile;
@@ -232,34 +249,66 @@ static bool adjacent_to_enemy(int x, int y, int team) {
   return false;
 }
 
+// ---- Threat map -----------------------------------------------------------
+// Every tile an enemy could attack on its next turn. Direct units threaten
+// the ring around anywhere they can move to; artillery cannot move and fire,
+// so it only threatens range 2-3 from where it already stands.
+
+static bool s_threat[GRID_H][GRID_W];
+static bool s_show_threat = false;
+
+static void recompute_threat(void) {
+  for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_W; x++) s_threat[y][x] = false;
+  }
+
+  for (int i = 0; i < s_unit_count; i++) {
+    if (!s_units[i].alive || s_units[i].team != 1) continue;
+    Unit *e = &s_units[i];
+
+    if (is_indirect(e->type)) {
+      for (int y = 0; y < GRID_H; y++) {
+        for (int x = 0; x < GRID_W; x++) {
+          int d = dist_xy(x, y, e->x, e->y);
+          if (d >= min_range(e->type) && d <= max_range(e->type)) s_threat[y][x] = true;
+        }
+      }
+      continue;
+    }
+
+    compute_reach_into(i, s_scratch);
+    const int dx[4] = { 0, 0, -1, 1 };
+    const int dy[4] = { -1, 1, 0, 0 };
+    for (int y = 0; y < GRID_H; y++) {
+      for (int x = 0; x < GRID_W; x++) {
+        if (s_scratch[y][x] == UNREACHABLE) continue;
+        for (int d = 0; d < 4; d++) {
+          int nx = x + dx[d], ny = y + dy[d];
+          if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
+          s_threat[ny][nx] = true;
+        }
+      }
+    }
+  }
+}
+
 // ---- Two-stage destination picking ----------------------------------------
-//  Stage 1 picks a group: firing positions, one of eight headings, or hold.
-//  Stage 2 picks how far along that heading to stop.
 
 #define GRP_ATTACK 0
 #define GRP_STAY   9
 
 static const char *GROUP_NAMES[] = {
-  "Attack from",      // 0
-  "North",            // 1
-  "North-East",       // 2
-  "East",             // 3
-  "South-East",       // 4
-  "South",            // 5
-  "South-West",       // 6
-  "West",             // 7
-  "North-West",       // 8
-  "Hold position",    // 9
+  "Attack from", "North", "North-East", "East", "South-East",
+  "South", "South-West", "West", "North-West", "Hold position",
 };
 
-// Which of the eight headings a tile lies in, relative to the unit.
 static int heading_of(int dx, int dy) {
   if (dx == 0 && dy == 0) return GRP_STAY;
   int adx = abs_i(dx), ady = abs_i(dy);
-  if (adx > 2 * ady) return (dx > 0) ? 3 : 7;          // East  / West
-  if (ady > 2 * adx) return (dy < 0) ? 1 : 5;          // North / South
-  if (dx > 0)        return (dy < 0) ? 2 : 4;          // NE    / SE
-  return                    (dy < 0) ? 8 : 6;          // NW    / SW
+  if (adx > 2 * ady) return (dx > 0) ? 3 : 7;
+  if (ady > 2 * adx) return (dy < 0) ? 1 : 5;
+  if (dx > 0)        return (dy < 0) ? 2 : 4;
+  return                    (dy < 0) ? 8 : 6;
 }
 
 static Tile    s_reach[MAX_REACH];
@@ -267,9 +316,9 @@ static uint8_t s_reach_grp[MAX_REACH];
 static uint8_t s_reach_cost[MAX_REACH];
 static int     s_reach_count = 0;
 
-static uint8_t s_groups[10];      // group ids that actually have tiles
+static uint8_t s_groups[10];
 static int     s_group_count = 0;
-static int     s_group = 0;       // index into s_groups
+static int     s_group = 0;
 
 static Tile    s_dests[MAX_REACH];
 static int     s_dest_count = 0;
@@ -286,7 +335,7 @@ static void classify_reach(int ui) {
 
       int grp;
       if (!is_indirect(u->type) && adjacent_to_enemy(x, y, u->team)) {
-        grp = GRP_ATTACK;                       // shortcut to the useful tiles
+        grp = GRP_ATTACK;
       } else {
         grp = heading_of(x - u->x, y - u->y);
       }
@@ -299,14 +348,10 @@ static void classify_reach(int ui) {
     }
   }
 
-  // Build the ordered list of non-empty groups: attack, headings, hold.
   s_group_count = 0;
   for (int g = 0; g <= 9; g++) {
     for (int i = 0; i < s_reach_count; i++) {
-      if (s_reach_grp[i] == g) {
-        s_groups[s_group_count++] = g;
-        break;
-      }
+      if (s_reach_grp[i] == g) { s_groups[s_group_count++] = g; break; }
     }
   }
   s_group = 0;
@@ -318,7 +363,6 @@ static int group_tile_count(int g) {
   return n;
 }
 
-// Farthest tile in a group - used as the stage 1 preview.
 static int group_preview(int g) {
   int best = -1, best_cost = -1;
   for (int i = 0; i < s_reach_count; i++) {
@@ -328,18 +372,16 @@ static int group_preview(int g) {
   return best;
 }
 
-// Tiles of one group, nearest first.
+// Farthest first, so the cursor opens on the tile the heading preview showed.
+// Down then steps back toward the unit.
 static void build_dests_for_group(int g) {
   s_dest_count = 0;
   for (int i = 0; i < s_reach_count; i++) {
     if (s_reach_grp[i] != g) continue;
-    s_dests[s_dest_count] = s_reach[i];
-    // insertion sort by cost as we go
+
+    int c = s_reach_cost[i];
     int j = s_dest_count - 1;
-    uint8_t c = s_reach_cost[i];
-    while (j >= 0) {
-      int jc = s_cost[s_dests[j].y][s_dests[j].x];
-      if (jc <= c) break;
+    while (j >= 0 && s_cost[s_dests[j].y][s_dests[j].x] < c) {
       s_dests[j + 1] = s_dests[j];
       j--;
     }
@@ -371,12 +413,8 @@ static void build_targets(int ui, bool moved) {
 // ---- Game state -----------------------------------------------------------
 
 typedef enum {
-  PHASE_BROWSE = 0,
-  PHASE_GROUP,
-  PHASE_MOVE,
-  PHASE_TARGET,
-  PHASE_ENEMY,
-  PHASE_OVER,
+  PHASE_BROWSE = 0, PHASE_GROUP, PHASE_MOVE,
+  PHASE_TARGET, PHASE_ENEMY, PHASE_OVER,
 } Phase;
 
 static Window   *s_window;
@@ -408,7 +446,6 @@ static void snap_browse_to_own(void) {
   }
 }
 
-// Jump to the next of your units that still has an action left.
 static void focus_next_unacted(int from) {
   for (int step = 1; step <= s_unit_count; step++) {
     int i = (from + step + s_unit_count) % s_unit_count;
@@ -426,6 +463,44 @@ static void cycle_own_unit(int dir) {
     int i = (s_browse + dir * step + s_unit_count * 8) % s_unit_count;
     if (s_units[i].alive && s_units[i].team == 0) { s_browse = i; return; }
   }
+}
+
+// ---- Save / restore -------------------------------------------------------
+// Saved at the start of your turn and after each of your actions, so putting
+// your wrist down mid-turn costs nothing. Never saved mid enemy turn, so a
+// resume never lands inside a half-finished AI sequence.
+
+typedef struct {
+  uint8_t version;
+  uint8_t unit_count;
+  int8_t  winner;
+  uint8_t pad;
+  Unit    units[MAX_UNITS];
+} SaveBlob;
+
+static void save_game(void) {
+  SaveBlob b;
+  memset(&b, 0, sizeof(b));
+  b.version    = SAVE_VERSION;
+  b.unit_count = s_unit_count;
+  b.winner     = (int8_t)s_winner;
+  memcpy(b.units, s_units, sizeof(s_units));
+  persist_write_data(PERSIST_KEY_SAVE, &b, sizeof(b));
+}
+
+static bool load_game(void) {
+  if (!persist_exists(PERSIST_KEY_SAVE)) return false;
+
+  SaveBlob b;
+  int n = persist_read_data(PERSIST_KEY_SAVE, &b, sizeof(b));
+  if (n != (int)sizeof(b)) return false;
+  if (b.version != SAVE_VERSION) return false;
+  if (b.unit_count == 0 || b.unit_count > MAX_UNITS) return false;
+
+  s_unit_count = b.unit_count;
+  memcpy(s_units, b.units, sizeof(s_units));
+  s_winner = b.winner;
+  return true;
 }
 
 // ---- Enemy AI -------------------------------------------------------------
@@ -518,6 +593,8 @@ static void begin_player_turn(void) {
   s_phase = PHASE_BROWSE;
   s_selected = -1;
   focus_next_unacted(s_unit_count - 1);
+  recompute_threat();
+  save_game();
 }
 
 static void ai_step(void *data) {
@@ -537,8 +614,10 @@ static void ai_step(void *data) {
 
   ai_act(next);
   check_game_over();
+  recompute_threat();
   layer_mark_dirty(s_canvas);
   if (s_phase == PHASE_ENEMY) schedule_ai();
+  else                        save_game();
 }
 
 static void begin_enemy_turn(void) {
@@ -550,7 +629,7 @@ static void begin_enemy_turn(void) {
   schedule_ai();
 }
 
-static void restart_game(void) {
+static void new_game(void) {
   if (s_ai_timer) { app_timer_cancel(s_ai_timer); s_ai_timer = NULL; }
   setup_units();
   s_winner = -1;
@@ -558,6 +637,8 @@ static void restart_game(void) {
   s_moved = false;
   s_phase = PHASE_BROWSE;
   focus_next_unacted(s_unit_count - 1);
+  recompute_threat();
+  save_game();
 }
 
 // ---- Drawing --------------------------------------------------------------
@@ -640,23 +721,32 @@ static void canvas_update(Layer *layer, GContext *ctx) {
       graphics_context_set_fill_color(ctx, terrain_color(ter));
       graphics_fill_rect(ctx, GRect(px, py, TILE, TILE), 0, GCornerNone);
       draw_terrain_mark(ctx, ter, px, py);
+
+      // Threat corner flag
+      if (s_show_threat && s_threat[y][x]) {
+        graphics_context_set_fill_color(ctx, GColorRed);
+        graphics_fill_rect(ctx, GRect(px + TILE - 6, py + 2, 4, 4), 0, GCornerNone);
+      }
+
       graphics_context_set_stroke_color(ctx, GColorBlack);
       graphics_draw_rect(ctx, GRect(px, py, TILE, TILE));
     }
   }
 
-  // Stage 1: show the whole group. Stage 2: show that group's tiles.
+  // Candidate tiles. Red dot means the enemy can hit you there next turn.
   if (s_phase == PHASE_GROUP && s_group_count > 0) {
     int g = s_groups[s_group];
-    graphics_context_set_fill_color(ctx, GColorBlack);
     for (int i = 0; i < s_reach_count; i++) {
       if (s_reach_grp[i] != g) continue;
+      graphics_context_set_fill_color(ctx,
+          s_threat[s_reach[i].y][s_reach[i].x] ? GColorRed : GColorBlack);
       graphics_fill_circle(ctx, GPoint(ox + s_reach[i].x * TILE + TILE / 2,
                                        oy + s_reach[i].y * TILE + TILE / 2), 3);
     }
   } else if (s_phase == PHASE_MOVE) {
-    graphics_context_set_fill_color(ctx, GColorBlack);
     for (int i = 0; i < s_dest_count; i++) {
+      graphics_context_set_fill_color(ctx,
+          s_threat[s_dests[i].y][s_dests[i].x] ? GColorRed : GColorBlack);
       graphics_fill_circle(ctx, GPoint(ox + s_dests[i].x * TILE + TILE / 2,
                                        oy + s_dests[i].y * TILE + TILE / 2), 2);
     }
@@ -726,7 +816,9 @@ static void canvas_update(Layer *layer, GContext *ctx) {
 
   } else if (s_phase == PHASE_MOVE) {
     Terrain ct = terrain_at(cx, cy);
-    snprintf(s_line1, sizeof(s_line1), "%s +%d%%", TERRAIN_NAMES[ct], TERRAIN_DEF[ct] * 20);
+    snprintf(s_line1, sizeof(s_line1), "%s +%d%%%s",
+             TERRAIN_NAMES[ct], TERRAIN_DEF[ct] * 20,
+             s_threat[cy][cx] ? "  RISK" : "");
     snprintf(s_line2, sizeof(s_line2), "%d steps   %d of %d",
              s_cost[cy][cx], s_dest + 1, s_dest_count);
 
@@ -763,6 +855,8 @@ static void finish_action(void) {
   s_phase = PHASE_BROWSE;
   focus_next_unacted(just_acted);
   check_game_over();
+  recompute_threat();
+  save_game();
 }
 
 static void up_handler(ClickRecognizerRef r, void *context) {
@@ -788,6 +882,13 @@ static void down_handler(ClickRecognizerRef r, void *context) {
   } else if (s_phase == PHASE_BROWSE) {
     cycle_own_unit(1);
   }
+  layer_mark_dirty(s_canvas);
+}
+
+// Hold Up anywhere to flag every tile the enemy could hit next turn.
+static void up_long_handler(ClickRecognizerRef r, void *context) {
+  s_show_threat = !s_show_threat;
+  if (s_show_threat) recompute_threat();
   layer_mark_dirty(s_canvas);
 }
 
@@ -828,7 +929,7 @@ static void select_handler(ClickRecognizerRef r, void *context) {
 
 static void select_long_handler(ClickRecognizerRef r, void *context) {
   if (s_phase == PHASE_OVER) {
-    restart_game();
+    new_game();
     layer_mark_dirty(s_canvas);
   } else if (s_phase == PHASE_BROWSE) {
     begin_enemy_turn();
@@ -850,16 +951,26 @@ static void back_handler(ClickRecognizerRef r, void *context) {
   } else if (s_phase == PHASE_ENEMY) {
     return;
   } else {
+    save_game();
     window_stack_pop(true);
   }
 }
 
+// Hold Back to abandon the saved match and start fresh.
+static void back_long_handler(ClickRecognizerRef r, void *context) {
+  if (s_phase == PHASE_ENEMY) return;
+  new_game();
+  layer_mark_dirty(s_canvas);
+}
+
 static void click_config(void *context) {
-  window_single_repeating_click_subscribe(BUTTON_ID_UP, 150, up_handler);
-  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 150, down_handler);
+  window_single_click_subscribe(BUTTON_ID_UP, up_handler);
+  window_long_click_subscribe(BUTTON_ID_UP, 500, up_long_handler, NULL);
+  window_single_click_subscribe(BUTTON_ID_DOWN, down_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, select_handler);
   window_long_click_subscribe(BUTTON_ID_SELECT, 500, select_long_handler, NULL);
   window_single_click_subscribe(BUTTON_ID_BACK, back_handler);
+  window_long_click_subscribe(BUTTON_ID_BACK, 700, back_long_handler, NULL);
 }
 
 // ---- App lifecycle --------------------------------------------------------
@@ -877,7 +988,21 @@ static void window_unload(Window *window) {
 }
 
 static void init(void) {
-  restart_game();
+  if (load_game()) {
+    s_selected = -1;
+    s_moved = false;
+    if (s_winner >= 0) {
+      s_phase = PHASE_OVER;
+      snap_browse_to_own();
+    } else {
+      s_phase = PHASE_BROWSE;
+      focus_next_unacted(s_unit_count - 1);
+    }
+    recompute_threat();
+  } else {
+    new_game();
+  }
+
   s_window = window_create();
   window_set_click_config_provider(s_window, click_config);
   window_set_window_handlers(s_window, (WindowHandlers) {
@@ -888,6 +1013,7 @@ static void init(void) {
 }
 
 static void deinit(void) {
+  save_game();
   window_destroy(s_window);
 }
 
