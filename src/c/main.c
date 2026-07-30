@@ -2,47 +2,55 @@
 #include <string.h>
 
 // ===========================================================================
-//  WristWars - step 8: undo, turn counter, safety confirms, match summary
+//  WristWars - step 9: capture objectives, HQ victory, in-app menu
 // ===========================================================================
 
 #define GRID_W    10
 #define GRID_H    10
 #define TILE      18
 #define MAX_UNITS 16
+#define MAX_SITES 12
 #define MAX_REACH (GRID_W * GRID_H)
 #define UNREACHABLE 255
 #define AI_STEP_MS  450
+#define CAPTURE_GOAL 20
 
-#define SAVE_VERSION     3
+#define SAVE_VERSION     4
 #define PERSIST_KEY_SAVE 1
 
 // ---- Terrain --------------------------------------------------------------
-//   .  = plains      F = forest
-//   M  = mountain    w = water
+//   .  = plains     F = forest     M = mountain    w = water
+//   c  = city       h = your HQ    e = enemy HQ
 
 static const char *MAP[GRID_H] = {
   ".......F..",
-  "..........",
-  "....M.F...",
+  "..c.....e.",
+  "...cM.F...",
   ".F.ww...F.",
-  "..Mwww...F",
-  "F...wwwM..",
+  "..Mwww.c.F",
+  "F.c.wwwM..",
   ".F...ww.F.",
-  "...F.M....",
-  "..........",
+  "...F.Mc...",
+  ".h.....c..",
   "..F.......",
 };
 
-typedef enum { T_PLAINS = 0, T_FOREST, T_MOUNTAIN, T_WATER } Terrain;
+typedef enum {
+  T_PLAINS = 0, T_FOREST, T_MOUNTAIN, T_WATER, T_CITY, T_HQ
+} Terrain;
 
-static const char *TERRAIN_NAMES[] = { "Plains", "Forest", "Mountain", "Sea" };
-static const int   TERRAIN_DEF[]   = { 0, 1, 2, 0 };
+static const char *TERRAIN_NAMES[] = {
+  "Plains", "Forest", "Mountain", "Sea", "City", "HQ"
+};
+static const int TERRAIN_DEF[] = { 0, 1, 2, 0, 1, 2 };
 
 static Terrain terrain_at(int x, int y) {
   switch (MAP[y][x]) {
     case 'F': return T_FOREST;
     case 'M': return T_MOUNTAIN;
     case 'w': return T_WATER;
+    case 'c': return T_CITY;
+    case 'h': case 'e': return T_HQ;
     default:  return T_PLAINS;
   }
 }
@@ -52,8 +60,60 @@ static GColor terrain_color(Terrain t) {
     case T_FOREST:   return GColorDarkGreen;
     case T_MOUNTAIN: return GColorWindsorTan;
     case T_WATER:    return GColorBlueMoon;
+    case T_CITY:     return GColorLightGray;
+    case T_HQ:       return GColorDarkGray;
     default:         return GColorMintGreen;
   }
+}
+
+// ---- Capturable sites -----------------------------------------------------
+// Ownership and capture progress live here rather than in the map, which is
+// const. Only these tiles need tracking, which keeps the save small.
+
+#define SITE_CITY 0
+#define SITE_HQ   1
+#define OWNER_NEUTRAL 2
+
+typedef struct {
+  uint8_t x, y;
+  uint8_t kind;
+  uint8_t owner;      // 0 you, 1 enemy, 2 neutral
+  uint8_t progress;   // toward CAPTURE_GOAL
+  uint8_t cap_team;   // who is part-way through capturing
+  uint8_t home;       // for an HQ, who it started as
+} Site;
+
+static Site s_sites[MAX_SITES];
+static int  s_site_count = 0;
+
+static void init_sites(void) {
+  s_site_count = 0;
+  for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_W; x++) {
+      char c = MAP[y][x];
+      if (c != 'c' && c != 'h' && c != 'e') continue;
+      if (s_site_count >= MAX_SITES) continue;
+
+      Site *s = &s_sites[s_site_count++];
+      s->x = x; s->y = y;
+      s->progress = 0;
+      s->cap_team = OWNER_NEUTRAL;
+      if (c == 'c') {
+        s->kind = SITE_CITY; s->owner = OWNER_NEUTRAL; s->home = OWNER_NEUTRAL;
+      } else {
+        s->kind = SITE_HQ;
+        s->owner = (c == 'h') ? 0 : 1;
+        s->home  = s->owner;
+      }
+    }
+  }
+}
+
+static int site_at(int x, int y) {
+  for (int i = 0; i < s_site_count; i++) {
+    if (s_sites[i].x == x && s_sites[i].y == y) return i;
+  }
+  return -1;
 }
 
 // ---- Units ----------------------------------------------------------------
@@ -85,7 +145,6 @@ typedef struct {
 static Unit    s_units[MAX_UNITS];
 static uint8_t s_unit_count = 0;
 
-// Match record, shown in the summary and carried in the save.
 static int s_turn        = 1;
 static int s_lost_player = 0;
 static int s_lost_enemy  = 0;
@@ -142,6 +201,13 @@ static int count_alive(int team) {
   return n;
 }
 
+static bool can_capture_here(int ui) {
+  Unit *u = &s_units[ui];
+  if (u->type != U_INFANTRY) return false;      // only boots take ground
+  int si = site_at(u->x, u->y);
+  return (si >= 0 && s_sites[si].owner != u->team);
+}
+
 // ---- Combat ---------------------------------------------------------------
 
 static int compute_damage(const Unit *att, const Unit *def) {
@@ -160,15 +226,19 @@ static bool can_counter(const Unit *def, const Unit *att) {
   return dist_between(def, att) <= max_range(def->type);
 }
 
+static void clear_capture_at(int x, int y) {
+  int si = site_at(x, y);
+  if (si >= 0) { s_sites[si].progress = 0; s_sites[si].cap_team = OWNER_NEUTRAL; }
+}
+
 static void kill_unit(Unit *u) {
   u->hp = 0;
   u->alive = false;
+  clear_capture_at(u->x, u->y);      // a dead capturer loses its progress
   if (u->team == 0) s_lost_player++;
   else              s_lost_enemy++;
 }
 
-// One buzz at most per exchange: double pulse if anything died, short pulse
-// if one of your units merely took a hit.
 static void resolve_attack(int ai, int di) {
   Unit *a = &s_units[ai];
   Unit *d = &s_units[di];
@@ -190,6 +260,26 @@ static void resolve_attack(int ai, int di) {
   else if (player_hurt) vibes_short_pulse();
 }
 
+// A full-health infantry needs two turns; a damaged one takes longer.
+static void do_capture(int ui) {
+  Unit *u = &s_units[ui];
+  int si = site_at(u->x, u->y);
+  if (si < 0) return;
+  Site *s = &s_sites[si];
+
+  if (s->cap_team != u->team) { s->progress = 0; s->cap_team = u->team; }
+  s->progress += u->hp;
+
+  if (s->progress >= CAPTURE_GOAL) {
+    s->owner = u->team;
+    s->progress = 0;
+    s->cap_team = OWNER_NEUTRAL;
+    vibes_double_pulse();
+  } else {
+    vibes_short_pulse();
+  }
+}
+
 // ---- Movement -------------------------------------------------------------
 
 static int move_cost(UnitType type, Terrain ter) {
@@ -197,12 +287,12 @@ static int move_cost(UnitType type, Terrain ter) {
     case T_WATER:    return -1;
     case T_MOUNTAIN: return (type == U_INFANTRY || type == U_BAZOOKA) ? 3 : -1;
     case T_FOREST:   return 2;
-    default:         return 1;
+    default:         return 1;      // plains, city, HQ
   }
 }
 
 static uint8_t s_cost[GRID_H][GRID_W];
-static uint8_t s_scratch[GRID_H][GRID_W];   // threat maths, keeps s_cost intact
+static uint8_t s_scratch[GRID_H][GRID_W];
 
 static void compute_reach_into(int ui, uint8_t out[GRID_H][GRID_W]) {
   Unit *u = &s_units[ui];
@@ -240,9 +330,7 @@ static void compute_reach_into(int ui, uint8_t out[GRID_H][GRID_W]) {
   }
 }
 
-static void compute_reach(int ui) {
-  compute_reach_into(ui, s_cost);
-}
+static void compute_reach(int ui) { compute_reach_into(ui, s_cost); }
 
 typedef struct { uint8_t x, y; } Tile;
 
@@ -262,8 +350,6 @@ static bool adjacent_to_enemy(int x, int y, int team) {
 }
 
 // ---- Threat map -----------------------------------------------------------
-// Direct units threaten the ring around anywhere they can move to. Artillery
-// cannot move and fire, so it only threatens range 2-3 from where it stands.
 
 static bool s_threat[GRID_H][GRID_W];
 static bool s_show_threat = false;
@@ -331,9 +417,9 @@ static uint8_t s_groups[10];
 static int     s_group_count = 0;
 static int     s_group = 0;
 
-static Tile    s_dests[MAX_REACH];
-static int     s_dest_count = 0;
-static int     s_dest = 0;
+static Tile s_dests[MAX_REACH];
+static int  s_dest_count = 0;
+static int  s_dest = 0;
 
 static void classify_reach(int ui) {
   Unit *u = &s_units[ui];
@@ -383,7 +469,6 @@ static int group_preview(int g) {
   return best;
 }
 
-// Farthest first, so the cursor opens on the tile the heading preview showed.
 static void build_dests_for_group(int g) {
   s_dest_count = 0;
   for (int i = 0; i < s_reach_count; i++) {
@@ -401,10 +486,21 @@ static void build_dests_for_group(int g) {
   s_dest = 0;
 }
 
-// ---- Targets --------------------------------------------------------------
+// ---- Targets and actions --------------------------------------------------
 
 static int     s_targets[MAX_UNITS];
 static uint8_t s_target_count = 0;
+static int     s_target = 0;
+
+#define ACT_ATTACK  0
+#define ACT_CAPTURE 1
+#define ACT_WAIT    2
+
+static const char *ACTION_NAMES[] = { "Attack", "Capture", "Wait" };
+
+static uint8_t s_actions[3];
+static int     s_action_count = 0;
+static int     s_action = 0;
 
 static void build_targets(int ui, bool moved) {
   Unit *u = &s_units[ui];
@@ -420,29 +516,39 @@ static void build_targets(int ui, bool moved) {
   }
 }
 
+static void build_actions(int ui, bool moved) {
+  build_targets(ui, moved);
+  s_action_count = 0;
+  if (s_target_count > 0)   s_actions[s_action_count++] = ACT_ATTACK;
+  if (can_capture_here(ui)) s_actions[s_action_count++] = ACT_CAPTURE;
+  s_actions[s_action_count++] = ACT_WAIT;
+  s_action = 0;
+}
+
 // ---- Game state -----------------------------------------------------------
 
 typedef enum {
-  PHASE_BROWSE = 0, PHASE_GROUP, PHASE_MOVE,
-  PHASE_TARGET, PHASE_ENEMY, PHASE_OVER,
+  PHASE_BROWSE = 0, PHASE_GROUP, PHASE_MOVE, PHASE_ACTION,
+  PHASE_TARGET, PHASE_ENEMY, PHASE_OVER, PHASE_MENU,
 } Phase;
 
-typedef enum { CONFIRM_NONE = 0, CONFIRM_END_TURN, CONFIRM_NEW_GAME } Confirm;
+static const char *MENU_ITEMS[] = { "Resume", "New game", "Exit" };
+#define MENU_COUNT 3
 
 static Window   *s_window;
 static Layer    *s_canvas;
 static AppTimer *s_ai_timer = NULL;
 
-static Phase   s_phase    = PHASE_BROWSE;
-static Confirm s_confirm  = CONFIRM_NONE;
-static int     s_browse   = 0;
-static int     s_target   = 0;
-static int     s_selected = -1;
-static bool    s_moved    = false;
-static int     s_winner   = -1;
+static Phase s_phase       = PHASE_BROWSE;
+static bool  s_confirm_end = false;
+static int   s_menu        = 0;
+static int   s_browse      = 0;
+static int   s_selected    = -1;
+static bool  s_moved       = false;
+static int   s_winner      = -1;
 
-// One level of undo, valid only inside your own turn.
 static Unit s_undo_units[MAX_UNITS];
+static Site s_undo_sites[MAX_SITES];
 static int  s_undo_browse = 0;
 static int  s_undo_lost_player = 0;
 static int  s_undo_lost_enemy  = 0;
@@ -450,6 +556,7 @@ static bool s_undo_ok = false;
 
 static void snapshot_for_undo(void) {
   memcpy(s_undo_units, s_units, sizeof(s_units));
+  memcpy(s_undo_sites, s_sites, sizeof(s_sites));
   s_undo_browse      = s_browse;
   s_undo_lost_player = s_lost_player;
   s_undo_lost_enemy  = s_lost_enemy;
@@ -457,6 +564,14 @@ static void snapshot_for_undo(void) {
 }
 
 static void check_game_over(void) {
+  for (int i = 0; i < s_site_count; i++) {
+    if (s_sites[i].kind != SITE_HQ) continue;
+    if (s_sites[i].owner != s_sites[i].home) {     // an HQ changed hands
+      s_winner = s_sites[i].owner;
+      s_phase = PHASE_OVER;
+      return;
+    }
+  }
   if (count_alive(1) == 0)      { s_winner = 0; s_phase = PHASE_OVER; }
   else if (count_alive(0) == 0) { s_winner = 1; s_phase = PHASE_OVER; }
 }
@@ -493,33 +608,57 @@ static void cycle_own_unit(int dir) {
   }
 }
 
+// Stalled captures decay, and units resting on ground you hold recover.
+static void turn_upkeep(int team) {
+  for (int i = 0; i < s_site_count; i++) {
+    Site *s = &s_sites[i];
+    if (s->progress == 0) continue;
+    int ui = unit_at(s->x, s->y);
+    if (ui < 0 || s_units[ui].team != s->cap_team) {
+      s->progress = 0;
+      s->cap_team = OWNER_NEUTRAL;
+    }
+  }
+
+  for (int i = 0; i < s_unit_count; i++) {
+    Unit *u = &s_units[i];
+    if (!u->alive || u->team != team || u->hp >= 10) continue;
+    int si = site_at(u->x, u->y);
+    if (si >= 0 && s_sites[si].owner == team) {
+      u->hp += 3;
+      if (u->hp > 10) u->hp = 10;
+    }
+  }
+}
+
 // ---- Save / restore -------------------------------------------------------
 
 typedef struct {
   uint8_t  version;
   uint8_t  unit_count;
+  uint8_t  site_count;
   int8_t   winner;
-  uint8_t  pad;
   uint16_t turn;
   uint8_t  lost_player;
   uint8_t  lost_enemy;
   Unit     units[MAX_UNITS];
+  Site     sites[MAX_SITES];
 } SaveBlob;
 
-// Never write mid enemy turn, so a resume can't land inside a half-finished
-// AI sequence. The system can kill the app at any moment, including then.
 static void save_game(void) {
-  if (s_phase == PHASE_ENEMY) return;
+  if (s_phase == PHASE_ENEMY) return;      // never persist a half-done AI turn
 
   SaveBlob b;
   memset(&b, 0, sizeof(b));
   b.version     = SAVE_VERSION;
   b.unit_count  = s_unit_count;
+  b.site_count  = (uint8_t)s_site_count;
   b.winner      = (int8_t)s_winner;
   b.turn        = (uint16_t)s_turn;
   b.lost_player = (uint8_t)s_lost_player;
   b.lost_enemy  = (uint8_t)s_lost_enemy;
   memcpy(b.units, s_units, sizeof(s_units));
+  memcpy(b.sites, s_sites, sizeof(s_sites));
   persist_write_data(PERSIST_KEY_SAVE, &b, sizeof(b));
 }
 
@@ -531,13 +670,16 @@ static bool load_game(void) {
   if (n != (int)sizeof(b)) return false;
   if (b.version != SAVE_VERSION) return false;
   if (b.unit_count == 0 || b.unit_count > MAX_UNITS) return false;
+  if (b.site_count == 0 || b.site_count > MAX_SITES) return false;
 
-  s_unit_count   = b.unit_count;
+  s_unit_count  = b.unit_count;
+  s_site_count  = b.site_count;
   memcpy(s_units, b.units, sizeof(s_units));
-  s_winner       = b.winner;
-  s_turn         = b.turn > 0 ? b.turn : 1;
-  s_lost_player  = b.lost_player;
-  s_lost_enemy   = b.lost_enemy;
+  memcpy(s_sites, b.sites, sizeof(s_sites));
+  s_winner      = b.winner;
+  s_turn        = b.turn > 0 ? b.turn : 1;
+  s_lost_player = b.lost_player;
+  s_lost_enemy  = b.lost_enemy;
   return true;
 }
 
@@ -575,6 +717,7 @@ static void ai_act(int ui) {
 
   int best_score = -1000000;
   int best_x = home_x, best_y = home_y, best_target = -1;
+  bool best_capture = false;
 
   for (int t = 0; t < s_ai_tile_count; t++) {
     int x = s_ai_tiles[t].x;
@@ -584,6 +727,7 @@ static void ai_act(int ui) {
     u->x = x; u->y = y;
     int def_bonus = TERRAIN_DEF[terrain_at(x, y)] * 15;
 
+    // Shots
     if (!(is_indirect(u->type) && moved)) {
       for (int i = 0; i < s_unit_count; i++) {
         if (!s_units[i].alive || s_units[i].team == u->team) continue;
@@ -602,19 +746,41 @@ static void ai_act(int ui) {
         }
 
         if (score > best_score) {
-          best_score = score; best_x = x; best_y = y; best_target = i;
+          best_score = score; best_x = x; best_y = y;
+          best_target = i; best_capture = false;
         }
       }
     }
 
+    // Ground worth taking
+    int si = site_at(x, y);
+    if (si >= 0 && u->type == U_INFANTRY && s_sites[si].owner != u->team) {
+      Site *s = &s_sites[si];
+      int score;
+      if (s->kind == SITE_HQ) {
+        bool finishes = (s->cap_team == u->team && s->progress + u->hp >= CAPTURE_GOAL);
+        score = finishes ? 6000 : 2600;        // taking the HQ ends the match
+      } else {
+        score = 850 + s->progress * 8;
+      }
+      score += def_bonus;
+      if (score > best_score) {
+        best_score = score; best_x = x; best_y = y;
+        best_target = -1; best_capture = true;
+      }
+    }
+
+    // Otherwise close the distance
     int approach = -nearest_foe_dist(x, y, u->team) * 10 + def_bonus / 3;
     if (approach > best_score) {
-      best_score = approach; best_x = x; best_y = y; best_target = -1;
+      best_score = approach; best_x = x; best_y = y;
+      best_target = -1; best_capture = false;
     }
   }
 
   u->x = best_x; u->y = best_y;
-  if (best_target >= 0) resolve_attack(ui, best_target);
+  if (best_target >= 0)   resolve_attack(ui, best_target);
+  else if (best_capture)  do_capture(ui);
   u->acted = true;
 }
 
@@ -629,10 +795,11 @@ static void begin_player_turn(void) {
     if (s_units[i].team == 0) s_units[i].acted = false;
   }
   s_turn++;
+  turn_upkeep(0);
   s_phase = PHASE_BROWSE;
   s_selected = -1;
-  s_confirm = CONFIRM_NONE;
-  s_undo_ok = false;               // can't undo across a turn boundary
+  s_confirm_end = false;
+  s_undo_ok = false;
   focus_next_unacted(s_unit_count - 1);
   recompute_threat();
   save_game();
@@ -649,7 +816,7 @@ static void ai_step(void *data) {
 
   if (next < 0) {
     begin_player_turn();
-    vibes_short_pulse();           // your move, in case you looked away
+    vibes_short_pulse();
     layer_mark_dirty(s_canvas);
     return;
   }
@@ -666,8 +833,9 @@ static void begin_enemy_turn(void) {
   for (int i = 0; i < s_unit_count; i++) {
     if (s_units[i].team == 1) s_units[i].acted = false;
   }
+  turn_upkeep(1);
   s_selected = -1;
-  s_confirm = CONFIRM_NONE;
+  s_confirm_end = false;
   s_undo_ok = false;
   s_phase = PHASE_ENEMY;
   schedule_ai();
@@ -675,6 +843,7 @@ static void begin_enemy_turn(void) {
 
 static void new_game(void) {
   if (s_ai_timer) { app_timer_cancel(s_ai_timer); s_ai_timer = NULL; }
+  init_sites();
   setup_units();
   s_turn = 1;
   s_lost_player = 0;
@@ -682,7 +851,7 @@ static void new_game(void) {
   s_winner = -1;
   s_selected = -1;
   s_moved = false;
-  s_confirm = CONFIRM_NONE;
+  s_confirm_end = false;
   s_undo_ok = false;
   s_phase = PHASE_BROWSE;
   focus_next_unacted(s_unit_count - 1);
@@ -691,6 +860,12 @@ static void new_game(void) {
 }
 
 // ---- Drawing --------------------------------------------------------------
+
+static GColor owner_color(int owner) {
+  if (owner == 0) return GColorWhite;
+  if (owner == 1) return GColorRed;
+  return GColorBlack;
+}
 
 static void draw_terrain_mark(GContext *ctx, Terrain ter, int px, int py) {
   int mid = TILE / 2;
@@ -715,6 +890,25 @@ static void draw_terrain_mark(GContext *ctx, Terrain ter, int px, int py) {
       break;
     default:
       break;
+  }
+}
+
+// A flag on every capturable tile, coloured by who holds it.
+static void draw_site_flag(GContext *ctx, const Site *s, int px, int py) {
+  int pole = px + 4;
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_draw_line(ctx, GPoint(pole, py + 3), GPoint(pole, py + TILE - 4));
+
+  graphics_context_set_fill_color(ctx, owner_color(s->owner));
+  graphics_fill_rect(ctx, GRect(pole + 1, py + 3, 7, 5), 0, GCornerNone);
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_draw_rect(ctx, GRect(pole + 1, py + 3, 7, 5));
+
+  if (s->kind == SITE_HQ) {   // a second bar marks the important one
+    graphics_context_set_fill_color(ctx, owner_color(s->owner));
+    graphics_fill_rect(ctx, GRect(pole + 1, py + 9, 5, 3), 0, GCornerNone);
+    graphics_context_set_stroke_color(ctx, GColorBlack);
+    graphics_draw_rect(ctx, GRect(pole + 1, py + 9, 5, 3));
   }
 }
 
@@ -753,6 +947,20 @@ static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
   }
 }
 
+// Describe a tile including who owns it, if anyone.
+static void tile_label(int x, int y, char *buf, int len) {
+  Terrain t = terrain_at(x, y);
+  int si = site_at(x, y);
+  if (si < 0) {
+    snprintf(buf, len, "%s +%d%%", TERRAIN_NAMES[t], TERRAIN_DEF[t] * 20);
+    return;
+  }
+  const char *who = "open";
+  if (s_sites[si].owner == 0)      who = "yours";
+  else if (s_sites[si].owner == 1) who = "enemy";
+  snprintf(buf, len, "%s %s +%d%%", TERRAIN_NAMES[t], who, TERRAIN_DEF[t] * 20);
+}
+
 static void canvas_update(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
@@ -771,6 +979,9 @@ static void canvas_update(Layer *layer, GContext *ctx) {
       graphics_fill_rect(ctx, GRect(px, py, TILE, TILE), 0, GCornerNone);
       draw_terrain_mark(ctx, ter, px, py);
 
+      int si = site_at(x, y);
+      if (si >= 0) draw_site_flag(ctx, &s_sites[si], px, py);
+
       if (s_show_threat && s_threat[y][x]) {
         graphics_context_set_fill_color(ctx, GColorRed);
         graphics_fill_rect(ctx, GRect(px + TILE - 6, py + 2, 4, 4), 0, GCornerNone);
@@ -781,7 +992,6 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     }
   }
 
-  // Candidate tiles. Red dot means the enemy can hit you there next turn.
   if (s_phase == PHASE_GROUP && s_group_count > 0) {
     int g = s_groups[s_group];
     for (int i = 0; i < s_reach_count; i++) {
@@ -804,6 +1014,19 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     if (s_units[i].alive) draw_unit(ctx, i, ox, oy);
   }
 
+  // Capture progress sits above the unit so it stays readable.
+  for (int i = 0; i < s_site_count; i++) {
+    Site *s = &s_sites[i];
+    if (s->progress == 0) continue;
+    int px = ox + s->x * TILE;
+    int py = oy + s->y * TILE;
+    int w = (TILE - 4) * s->progress / CAPTURE_GOAL;
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_rect(ctx, GRect(px + 2, py + 1, TILE - 4, 3), 0, GCornerNone);
+    graphics_context_set_fill_color(ctx, owner_color(s->cap_team));
+    graphics_fill_rect(ctx, GRect(px + 2, py + 1, w, 3), 0, GCornerNone);
+  }
+
   if (s_selected >= 0) {
     graphics_context_set_stroke_color(ctx, GColorCyan);
     graphics_context_set_stroke_width(ctx, 2);
@@ -821,8 +1044,9 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     cx = s_dests[s_dest].x; cy = s_dests[s_dest].y;
   } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
     cx = s_units[s_targets[s_target]].x; cy = s_units[s_targets[s_target]].y;
-  } else if (s_phase == PHASE_BROWSE) {
-    cx = s_units[s_browse].x; cy = s_units[s_browse].y;
+  } else if (s_phase == PHASE_BROWSE || s_phase == PHASE_ACTION) {
+    int who = (s_phase == PHASE_ACTION && s_selected >= 0) ? s_selected : s_browse;
+    cx = s_units[who].x; cy = s_units[who].y;
   } else {
     show_cursor = false;
   }
@@ -837,6 +1061,7 @@ static void canvas_update(Layer *layer, GContext *ctx) {
 
   static char s_line1[44];
   static char s_line2[44];
+  static char s_tile[28];
   int top = oy + GRID_H * TILE;
 
   if (s_phase == PHASE_OVER) {
@@ -849,14 +1074,25 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     snprintf(s_line2, sizeof(s_line2), "T%d   You %d  Enemy %d",
              s_turn, count_alive(0), count_alive(1));
 
+  } else if (s_phase == PHASE_ACTION) {
+    snprintf(s_line1, sizeof(s_line1), "%s", ACTION_NAMES[s_actions[s_action]]);
+    if (s_actions[s_action] == ACT_CAPTURE) {
+      int si = site_at(s_units[s_selected].x, s_units[s_selected].y);
+      int have = (si >= 0 && s_sites[si].cap_team == 0) ? s_sites[si].progress : 0;
+      snprintf(s_line2, sizeof(s_line2), "%d/%d after this",
+               have + s_units[s_selected].hp, CAPTURE_GOAL);
+    } else {
+      snprintf(s_line2, sizeof(s_line2), "%d of %d", s_action + 1, s_action_count);
+    }
+
   } else if (s_phase == PHASE_TARGET) {
     Unit *a = &s_units[s_selected];
     Unit *d = &s_units[s_targets[s_target]];
-    Terrain dt = terrain_at(d->x, d->y);
     int out  = compute_damage(a, d);
     int back = can_counter(d, a) ? compute_damage(d, a) : 0;
+    tile_label(d->x, d->y, s_tile, sizeof(s_tile));
     snprintf(s_line1, sizeof(s_line1), "%s  -%d / -%d", UNIT_NAMES[d->type], out, back);
-    snprintf(s_line2, sizeof(s_line2), "on %s +%d%%", TERRAIN_NAMES[dt], TERRAIN_DEF[dt] * 20);
+    snprintf(s_line2, sizeof(s_line2), "on %s", s_tile);
 
   } else if (s_phase == PHASE_GROUP) {
     int g = s_group_count > 0 ? s_groups[s_group] : GRP_STAY;
@@ -865,28 +1101,22 @@ static void canvas_update(Layer *layer, GContext *ctx) {
              group_tile_count(g), s_group + 1, s_group_count);
 
   } else if (s_phase == PHASE_MOVE) {
-    Terrain ct = terrain_at(cx, cy);
-    snprintf(s_line1, sizeof(s_line1), "%s +%d%%%s",
-             TERRAIN_NAMES[ct], TERRAIN_DEF[ct] * 20, s_threat[cy][cx] ? "  RISK" : "");
+    tile_label(cx, cy, s_tile, sizeof(s_tile));
+    snprintf(s_line1, sizeof(s_line1), "%s%s", s_tile, s_threat[cy][cx] ? " RISK" : "");
     snprintf(s_line2, sizeof(s_line2), "%d steps   %d of %d",
              s_cost[cy][cx], s_dest + 1, s_dest_count);
 
   } else {
     Unit *u = &s_units[s_browse];
-    Terrain ut = terrain_at(u->x, u->y);
     snprintf(s_line1, sizeof(s_line1), "%s %d%s",
              UNIT_NAMES[u->type], u->hp, u->acted ? " used" : "");
-
-    if (s_confirm == CONFIRM_END_TURN) {
+    if (s_confirm_end) {
       snprintf(s_line2, sizeof(s_line2), "Hold Select again to end");
-    } else if (s_confirm == CONFIRM_NEW_GAME) {
-      snprintf(s_line2, sizeof(s_line2), "Hold Back again: new game");
     } else if (all_player_used()) {
       snprintf(s_line2, sizeof(s_line2), "T%d  all used: hold Select", s_turn);
     } else {
-      snprintf(s_line2, sizeof(s_line2), "T%d  %s +%d%%   %d v %d",
-               s_turn, TERRAIN_NAMES[ut], TERRAIN_DEF[ut] * 20,
-               count_alive(0), count_alive(1));
+      tile_label(u->x, u->y, s_tile, sizeof(s_tile));
+      snprintf(s_line2, sizeof(s_line2), "T%d  %s", s_turn, s_tile);
     }
   }
 
@@ -895,11 +1125,34 @@ static void canvas_update(Layer *layer, GContext *ctx) {
                      GRect(0, top, bounds.size.w, 22),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
-  graphics_context_set_text_color(ctx,
-      s_confirm == CONFIRM_NONE ? GColorLightGray : GColorIcterine);
+  graphics_context_set_text_color(ctx, s_confirm_end ? GColorIcterine : GColorLightGray);
   graphics_draw_text(ctx, s_line2, fonts_get_system_font(FONT_KEY_GOTHIC_14),
                      GRect(0, top + 21, bounds.size.w, 18),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+  // Menu overlay, drawn last so the board stays visible behind it.
+  if (s_phase == PHASE_MENU) {
+    GRect panel = GRect(22, 52, bounds.size.w - 44, 92);
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_rect(ctx, panel, 5, GCornersAll);
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    graphics_draw_round_rect(ctx, panel, 5);
+
+    for (int i = 0; i < MENU_COUNT; i++) {
+      GRect row = GRect(panel.origin.x + 5, panel.origin.y + 7 + i * 27,
+                        panel.size.w - 10, 24);
+      if (i == s_menu) {
+        graphics_context_set_fill_color(ctx, GColorYellow);
+        graphics_fill_rect(ctx, row, 3, GCornersAll);
+        graphics_context_set_text_color(ctx, GColorBlack);
+      } else {
+        graphics_context_set_text_color(ctx, GColorWhite);
+      }
+      graphics_draw_text(ctx, MENU_ITEMS[i], fonts_get_system_font(FONT_KEY_GOTHIC_18),
+                         row, GTextOverflowModeTrailingEllipsis,
+                         GTextAlignmentCenter, NULL);
+    }
+  }
 }
 
 // ---- Buttons --------------------------------------------------------------
@@ -916,11 +1169,15 @@ static void finish_action(void) {
 }
 
 static void up_handler(ClickRecognizerRef r, void *context) {
-  s_confirm = CONFIRM_NONE;
-  if (s_phase == PHASE_GROUP && s_group_count > 0) {
+  s_confirm_end = false;
+  if (s_phase == PHASE_MENU) {
+    s_menu = (s_menu + MENU_COUNT - 1) % MENU_COUNT;
+  } else if (s_phase == PHASE_GROUP && s_group_count > 0) {
     s_group = (s_group + s_group_count - 1) % s_group_count;
   } else if (s_phase == PHASE_MOVE && s_dest_count > 0) {
     s_dest = (s_dest + s_dest_count - 1) % s_dest_count;
+  } else if (s_phase == PHASE_ACTION) {
+    s_action = (s_action + s_action_count - 1) % s_action_count;
   } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
     s_target = (s_target + s_target_count - 1) % s_target_count;
   } else if (s_phase == PHASE_BROWSE) {
@@ -930,11 +1187,15 @@ static void up_handler(ClickRecognizerRef r, void *context) {
 }
 
 static void down_handler(ClickRecognizerRef r, void *context) {
-  s_confirm = CONFIRM_NONE;
-  if (s_phase == PHASE_GROUP && s_group_count > 0) {
+  s_confirm_end = false;
+  if (s_phase == PHASE_MENU) {
+    s_menu = (s_menu + 1) % MENU_COUNT;
+  } else if (s_phase == PHASE_GROUP && s_group_count > 0) {
     s_group = (s_group + 1) % s_group_count;
   } else if (s_phase == PHASE_MOVE && s_dest_count > 0) {
     s_dest = (s_dest + 1) % s_dest_count;
+  } else if (s_phase == PHASE_ACTION) {
+    s_action = (s_action + 1) % s_action_count;
   } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
     s_target = (s_target + 1) % s_target_count;
   } else if (s_phase == PHASE_BROWSE) {
@@ -943,24 +1204,24 @@ static void down_handler(ClickRecognizerRef r, void *context) {
   layer_mark_dirty(s_canvas);
 }
 
-// Hold Up anywhere: flag every tile the enemy could hit next turn.
 static void up_long_handler(ClickRecognizerRef r, void *context) {
+  if (s_phase == PHASE_MENU) return;
   s_show_threat = !s_show_threat;
   if (s_show_threat) recompute_threat();
   layer_mark_dirty(s_canvas);
 }
 
-// Hold Down in browse: take back your last action.
 static void down_long_handler(ClickRecognizerRef r, void *context) {
   if (s_phase != PHASE_BROWSE || !s_undo_ok) return;
 
   memcpy(s_units, s_undo_units, sizeof(s_units));
-  s_browse       = s_undo_browse;
-  s_lost_player  = s_undo_lost_player;
-  s_lost_enemy   = s_undo_lost_enemy;
-  s_undo_ok      = false;
-  s_selected     = -1;
-  s_confirm      = CONFIRM_NONE;
+  memcpy(s_sites, s_undo_sites, sizeof(s_sites));
+  s_browse      = s_undo_browse;
+  s_lost_player = s_undo_lost_player;
+  s_lost_enemy  = s_undo_lost_enemy;
+  s_undo_ok     = false;
+  s_selected    = -1;
+  s_confirm_end = false;
   recompute_threat();
   save_game();
   vibes_short_pulse();
@@ -968,7 +1229,21 @@ static void down_long_handler(ClickRecognizerRef r, void *context) {
 }
 
 static void select_handler(ClickRecognizerRef r, void *context) {
-  s_confirm = CONFIRM_NONE;
+  if (s_phase == PHASE_MENU) {
+    if (s_menu == 0) {
+      s_phase = (s_winner >= 0) ? PHASE_OVER : PHASE_BROWSE;
+    } else if (s_menu == 1) {
+      new_game();
+    } else {
+      save_game();
+      window_stack_pop(true);
+      return;
+    }
+    layer_mark_dirty(s_canvas);
+    return;
+  }
+
+  s_confirm_end = false;
 
   if (s_phase == PHASE_BROWSE) {
     if (s_units[s_browse].acted) return;
@@ -994,9 +1269,28 @@ static void select_handler(ClickRecognizerRef r, void *context) {
     } else {
       s_moved = false;
     }
-    build_targets(s_selected, s_moved);
-    if (s_target_count > 0) { s_target = 0; s_phase = PHASE_TARGET; }
-    else                    { finish_action(); }
+    build_actions(s_selected, s_moved);
+
+    if (s_action_count == 1) {
+      finish_action();                                    // nothing to do but wait
+    } else if (s_action_count == 2 && s_actions[0] == ACT_ATTACK) {
+      s_target = 0;
+      s_phase = PHASE_TARGET;                             // keep the quick attack path
+    } else {
+      s_phase = PHASE_ACTION;
+    }
+
+  } else if (s_phase == PHASE_ACTION) {
+    int act = s_actions[s_action];
+    if (act == ACT_ATTACK) {
+      s_target = 0;
+      s_phase = PHASE_TARGET;
+    } else if (act == ACT_CAPTURE) {
+      do_capture(s_selected);
+      finish_action();
+    } else {
+      finish_action();
+    }
 
   } else if (s_phase == PHASE_TARGET) {
     resolve_attack(s_selected, s_targets[s_target]);
@@ -1006,12 +1300,13 @@ static void select_handler(ClickRecognizerRef r, void *context) {
 }
 
 static void select_long_handler(ClickRecognizerRef r, void *context) {
+  if (s_phase == PHASE_MENU) return;
+
   if (s_phase == PHASE_OVER) {
     new_game();
   } else if (s_phase == PHASE_BROWSE) {
-    // Ending with units still to move needs a second hold.
-    if (!all_player_used() && s_confirm != CONFIRM_END_TURN) {
-      s_confirm = CONFIRM_END_TURN;
+    if (!all_player_used() && !s_confirm_end) {
+      s_confirm_end = true;
     } else {
       begin_enemy_turn();
     }
@@ -1019,34 +1314,24 @@ static void select_long_handler(ClickRecognizerRef r, void *context) {
   layer_mark_dirty(s_canvas);
 }
 
+// Back never quits on its own any more. It steps back, or opens the menu.
 static void back_handler(ClickRecognizerRef r, void *context) {
-  s_confirm = CONFIRM_NONE;
+  s_confirm_end = false;
 
-  if (s_phase == PHASE_GROUP) {
+  if (s_phase == PHASE_MENU) {
+    s_phase = (s_winner >= 0) ? PHASE_OVER : PHASE_BROWSE;
+  } else if (s_phase == PHASE_GROUP) {
     s_selected = -1;
     s_phase = PHASE_BROWSE;
   } else if (s_phase == PHASE_MOVE) {
     s_phase = PHASE_GROUP;
-  } else if (s_phase == PHASE_TARGET) {
+  } else if (s_phase == PHASE_ACTION || s_phase == PHASE_TARGET) {
     finish_action();
   } else if (s_phase == PHASE_ENEMY) {
     return;
   } else {
-    save_game();
-    window_stack_pop(true);
-    return;
-  }
-  layer_mark_dirty(s_canvas);
-}
-
-// Hold Back twice: abandon the saved match.
-static void back_long_handler(ClickRecognizerRef r, void *context) {
-  if (s_phase == PHASE_ENEMY) return;
-
-  if (s_confirm != CONFIRM_NEW_GAME) {
-    s_confirm = CONFIRM_NEW_GAME;
-  } else {
-    new_game();
+    s_menu = 0;
+    s_phase = PHASE_MENU;
   }
   layer_mark_dirty(s_canvas);
 }
@@ -1059,7 +1344,6 @@ static void click_config(void *context) {
   window_single_click_subscribe(BUTTON_ID_SELECT, select_handler);
   window_long_click_subscribe(BUTTON_ID_SELECT, 500, select_long_handler, NULL);
   window_single_click_subscribe(BUTTON_ID_BACK, back_handler);
-  window_long_click_subscribe(BUTTON_ID_BACK, 700, back_long_handler, NULL);
 }
 
 // ---- App lifecycle --------------------------------------------------------
@@ -1077,10 +1361,12 @@ static void window_unload(Window *window) {
 }
 
 static void init(void) {
+  init_sites();
+
   if (load_game()) {
     s_selected = -1;
     s_moved = false;
-    s_confirm = CONFIRM_NONE;
+    s_confirm_end = false;
     s_undo_ok = false;
     if (s_winner >= 0) {
       s_phase = PHASE_OVER;
