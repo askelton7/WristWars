@@ -2,7 +2,7 @@
 #include <string.h>
 
 // ===========================================================================
-//  WristWars - step 10: levels, campaign, unit icons, front-end menus
+//  WristWars - step 11: artillery rework, terrain-aware AI, denser maps
 // ===========================================================================
 
 #define GRID_W    10
@@ -15,7 +15,7 @@
 #define AI_STEP_MS  450
 #define CAPTURE_GOAL 20
 
-#define SAVE_VERSION     5
+#define SAVE_VERSION     6
 #define PERSIST_KEY_SAVE 1
 #define PERSIST_KEY_PROG 2
 
@@ -48,60 +48,60 @@ static const Deploy s_dep6[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 
 static const Level LEVELS[] = {
   { "First Contact", {
       "..........",
-      "..........",
+      "...F......",
+      "..FFF..F..",
+      "...F......",
+      "..F..FF...",
+      "...FF..F..",
+      "......F...",
+      "..F...FF..",
       "....F.....",
-      "..........",
-      "...FF.....",
-      ".....FF...",
-      "..........",
-      ".....F....",
-      "..........",
       ".........." },
-    s_dep0, ARRAY_LENGTH(s_dep0), true, false, "Move and attack. Wipe them out." },
+    s_dep0, ARRAY_LENGTH(s_dep0), true, false, "Forest blunts hits. Watch the numbers." },
   { "High Ground", {
-      "..........",
-      "..........",
-      "...MM.....",
-      "...MM.....",
-      "..........",
-      "....FF....",
-      "..........",
+      "....M.....",
+      "..MMMM....",
+      "..MM.MM...",
+      "...MM..F..",
+      "......F...",
+      "..FF...MM.",
+      "....F..MM.",
       "..........",
       "..........",
       ".........." },
     s_dep1, ARRAY_LENGTH(s_dep1), true, false, "Mountains cut damage 40%." },
   { "Armour", {
       "..........",
-      "....ww....",
-      "....ww....",
-      "..........",
-      "..F....F..",
-      "..........",
-      "..F....F..",
-      "..........",
+      "..MM......",
+      "..MM....F.",
+      "......F...",
+      "..FF...MM.",
+      ".....F.MM.",
+      "..MM......",
+      "....FF....",
       "..........",
       ".........." },
-    s_dep2, ARRAY_LENGTH(s_dep2), true, false, "Bazookas shred armour." },
+    s_dep2, ARRAY_LENGTH(s_dep2), true, false, "Bazookas shred armour. Hills stop it." },
   { "Shellfire", {
       "..........",
       "..........",
       "..........",
-      "..........",
-      ".wwww.www.",
+      "..FF..FF..",
+      ".www..www.",
       "..........",
       "..F....F..",
       "..........",
-      "..........",
+      "....M.....",
       ".........." },
-    s_dep3, ARRAY_LENGTH(s_dep3), true, false, "Artillery must hold still to fire." },
+    s_dep3, ARRAY_LENGTH(s_dep3), true, false, "Artillery hits hardest standing still." },
   { "Take the City", {
       "..........",
       "..c....c..",
-      "..........",
-      "...FF.....",
-      "..........",
-      "..........",
-      ".....FF...",
+      "...F.F....",
+      "..FF...MM.",
+      "....FF....",
+      "..MM...FF.",
+      "....F.....",
       "..c....c..",
       "..........",
       ".........." },
@@ -226,7 +226,7 @@ static const int DMG[4][4] = {
   /*Inf */ {  5,   5,   1,   6 },
   /*Bzka*/ {  6,   5,   7,   7 },
   /*Tank*/ {  7,   7,   5,   8 },
-  /*Arty*/ {  7,   7,   6,   7 },
+  /*Arty*/ {  8,   8,   8,   8 },
 };
 
 typedef struct {
@@ -247,7 +247,7 @@ static int s_lost_enemy  = 0;
 
 static bool is_indirect(UnitType t) { return t == U_ARTILLERY; }
 static int  min_range(UnitType t)   { return is_indirect(t) ? 2 : 1; }
-static int  max_range(UnitType t)   { return is_indirect(t) ? 3 : 1; }
+static int  max_range(UnitType t)   { return is_indirect(t) ? 4 : 1; }
 
 static int abs_i(int v) { return v < 0 ? -v : v; }
 
@@ -295,14 +295,21 @@ static bool can_capture_here(int ui) {
 
 // ---- Combat ---------------------------------------------------------------
 
-static int compute_damage(const Unit *att, const Unit *def) {
+// Indirect fire loses 40% if the gun moved this turn. Everything else
+// ignores the flag, so the rest of the game is unchanged.
+static int damage_from(const Unit *att, const Unit *def, bool moved) {
   int base = DMG[att->type][def->type];
   if (base <= 0) return 0;
   int dmg = base * att->hp / 10;
   int d   = TERRAIN_DEF[terrain_at(def->x, def->y)];
   dmg = dmg * (10 - 2 * d) / 10;
+  if (moved && is_indirect((UnitType)att->type)) dmg = dmg * 6 / 10;
   if (dmg < 1) dmg = 1;
   return dmg;
+}
+
+static int compute_damage(const Unit *att, const Unit *def) {
+  return damage_from(att, def, false);
 }
 
 static bool can_counter(const Unit *def, const Unit *att) {
@@ -324,12 +331,12 @@ static void kill_unit(Unit *u) {
   else              s_lost_enemy++;
 }
 
-static void resolve_attack(int ai, int di) {
+static void resolve_attack(int ai, int di, bool moved) {
   Unit *a = &s_units[ai];
   Unit *d = &s_units[di];
   bool died = false, player_hurt = false;
 
-  int dmg = compute_damage(a, d);
+  int dmg = damage_from(a, d, moved);
   d->hp -= dmg;
   if (d->team == 0) player_hurt = true;
   if (d->hp <= 0) { kill_unit(d); died = true; }
@@ -433,6 +440,17 @@ static bool adjacent_to_enemy(int x, int y, int team) {
   return false;
 }
 
+// True if an indirect unit sitting on (x,y) has anything in its range band.
+static bool can_shell_from(int ui, int x, int y) {
+  Unit *u = &s_units[ui];
+  for (int i = 0; i < s_unit_count; i++) {
+    if (!s_units[i].alive || s_units[i].team == u->team) continue;
+    int d = dist_xy(x, y, s_units[i].x, s_units[i].y);
+    if (d >= min_range((UnitType)u->type) && d <= max_range((UnitType)u->type)) return true;
+  }
+  return false;
+}
+
 // ---- Threat map -----------------------------------------------------------
 
 static bool s_threat[GRID_H][GRID_W];
@@ -515,8 +533,16 @@ static void classify_reach(int ui) {
       if (!tile_free(x, y, ui)) continue;
 
       int grp;
-      if (!is_indirect(u->type) && adjacent_to_enemy(x, y, u->team)) grp = GRP_ATTACK;
-      else                                                          grp = heading_of(x - u->x, y - u->y);
+      if (is_indirect(u->type)) {
+        // Group 0 for a gun means "don't move, fire at full power".
+        bool home = (x == u->x && y == u->y);
+        grp = (home && can_shell_from(ui, x, y)) ? GRP_ATTACK
+                                                 : heading_of(x - u->x, y - u->y);
+      } else if (adjacent_to_enemy(x, y, u->team)) {
+        grp = GRP_ATTACK;
+      } else {
+        grp = heading_of(x - u->x, y - u->y);
+      }
 
       s_reach[s_reach_count].x = x;
       s_reach[s_reach_count].y = y;
@@ -585,7 +611,7 @@ static int     s_action = 0;
 static void build_targets(int ui, bool moved) {
   Unit *u = &s_units[ui];
   s_target_count = 0;
-  if (is_indirect(u->type) && moved) return;
+  (void)moved;                 // guns may now fire after moving, at reduced power
 
   for (int i = 0; i < s_unit_count; i++) {
     if (!s_units[i].alive || s_units[i].team == u->team) continue;
@@ -886,6 +912,7 @@ static void ai_act(int ui) {
   int best_score = -1000000;
   int best_x = home_x, best_y = home_y, best_target = -1;
   bool best_capture = false;
+  bool best_moved   = false;
 
   for (int t = 0; t < s_ai_tile_count; t++) {
     int x = s_ai_tiles[t].x;
@@ -893,16 +920,16 @@ static void ai_act(int ui) {
     bool moved = (x != home_x || y != home_y);
 
     u->x = x; u->y = y;
-    int def_bonus = TERRAIN_DEF[terrain_at(x, y)] * 15;
+    int def_bonus = TERRAIN_DEF[terrain_at(x, y)] * 20;
 
-    if (!(is_indirect(u->type) && moved)) {
+    {
       for (int i = 0; i < s_unit_count; i++) {
         if (!s_units[i].alive || s_units[i].team == u->team) continue;
         int d = dist_between(u, &s_units[i]);
         if (d < min_range(u->type) || d > max_range(u->type)) continue;
 
         Unit *victim = &s_units[i];
-        int dmg = compute_damage(u, victim);
+        int dmg = damage_from(u, victim, moved);
         int score = 1000 + dmg * 10 + def_bonus;
 
         if (dmg >= victim->hp) score += 300 + UNIT_VALUE[victim->type] * 60;
@@ -914,7 +941,7 @@ static void ai_act(int ui) {
 
         if (score > best_score) {
           best_score = score; best_x = x; best_y = y;
-          best_target = i; best_capture = false;
+          best_target = i; best_capture = false; best_moved = moved;
         }
       }
     }
@@ -932,19 +959,28 @@ static void ai_act(int ui) {
       score += def_bonus;
       if (score > best_score) {
         best_score = score; best_x = x; best_y = y;
-        best_target = -1; best_capture = true;
+        best_target = -1; best_capture = true; best_moved = moved;
       }
     }
 
-    int approach = -nearest_foe_dist(x, y, u->team) * 10 + def_bonus / 3;
+    // No shot from here: walk toward the fight, but pay real attention to cover.
+    // Guns instead hold a standoff distance in the middle of their range band.
+    int cover = TERRAIN_DEF[terrain_at(x, y)] * 12;
+    int approach;
+    if (is_indirect(u->type)) {
+      int ideal = (min_range(u->type) + max_range(u->type)) / 2;
+      approach = -abs_i(nearest_foe_dist(x, y, u->team) - ideal) * 12 + cover;
+    } else {
+      approach = -nearest_foe_dist(x, y, u->team) * 10 + cover;
+    }
     if (approach > best_score) {
       best_score = approach; best_x = x; best_y = y;
-      best_target = -1; best_capture = false;
+      best_target = -1; best_capture = false; best_moved = moved;
     }
   }
 
   u->x = best_x; u->y = best_y;
-  if (best_target >= 0)  resolve_attack(ui, best_target);
+  if (best_target >= 0)  resolve_attack(ui, best_target, best_moved);
   else if (best_capture) do_capture(ui);
   u->acted = true;
 }
@@ -1347,17 +1383,31 @@ static void canvas_update(Layer *layer, GContext *ctx) {
   } else if (s_phase == PHASE_TARGET) {
     Unit *a = &s_units[s_selected];
     Unit *d = &s_units[s_targets[s_target]];
-    int out  = compute_damage(a, d);
+    bool weak = (s_moved && is_indirect((UnitType)a->type));
+    int out  = damage_from(a, d, s_moved);
     int back = can_counter(d, a) ? compute_damage(d, a) : 0;
     tile_label(d->x, d->y, s_tile, sizeof(s_tile));
     snprintf(s_line1, sizeof(s_line1), "%s  -%d / -%d", UNIT_NAMES[d->type], out, back);
-    snprintf(s_line2, sizeof(s_line2), "on %s", s_tile);
+    snprintf(s_line2, sizeof(s_line2), "%s%s", s_tile, weak ? "  moved -40%" : "");
 
   } else if (s_phase == PHASE_GROUP) {
     int g = s_group_count > 0 ? s_groups[s_group] : GRP_STAY;
-    snprintf(s_line1, sizeof(s_line1), "%s", GROUP_NAMES[g]);
-    snprintf(s_line2, sizeof(s_line2), "%d tiles   %d of %d",
-             group_tile_count(g), s_group + 1, s_group_count);
+    bool gun = (s_selected >= 0 && is_indirect((UnitType)s_units[s_selected].type));
+
+    if (gun && g == GRP_ATTACK) {
+      snprintf(s_line1, sizeof(s_line1), "Fire from here");
+      snprintf(s_line2, sizeof(s_line2), "full power   %d of %d",
+               s_group + 1, s_group_count);
+    } else {
+      snprintf(s_line1, sizeof(s_line1), "%s", GROUP_NAMES[g]);
+      if (gun) {
+        snprintf(s_line2, sizeof(s_line2), "fire after moving: -40%%   %d of %d",
+                 s_group + 1, s_group_count);
+      } else {
+        snprintf(s_line2, sizeof(s_line2), "%d tiles   %d of %d",
+                 group_tile_count(g), s_group + 1, s_group_count);
+      }
+    }
 
   } else if (s_phase == PHASE_MOVE) {
     tile_label(cx, cy, s_tile, sizeof(s_tile));
@@ -1367,8 +1417,15 @@ static void canvas_update(Layer *layer, GContext *ctx) {
 
   } else {
     Unit *u = &s_units[s_browse];
-    snprintf(s_line1, sizeof(s_line1), "%s %d%s",
-             UNIT_NAMES[u->type], u->hp, u->acted ? " used" : "");
+    if (is_indirect((UnitType)u->type)) {
+      snprintf(s_line1, sizeof(s_line1), "%s %d R%d-%d%s",
+               UNIT_NAMES[u->type], u->hp,
+               min_range((UnitType)u->type), max_range((UnitType)u->type),
+               u->acted ? " used" : "");
+    } else {
+      snprintf(s_line1, sizeof(s_line1), "%s %d%s",
+               UNIT_NAMES[u->type], u->hp, u->acted ? " used" : "");
+    }
     if (s_confirm_end) {
       snprintf(s_line2, sizeof(s_line2), "Hold Select again to end");
     } else if (s_turn == 1) {
@@ -1574,8 +1631,17 @@ static void select_handler(ClickRecognizerRef r, void *context) {
     s_phase = PHASE_GROUP;
 
   } else if (s_phase == PHASE_GROUP) {
-    if (s_group_count == 0) { finish_action(); }
-    else {
+    if (s_group_count == 0) {
+      finish_action();
+    } else if (is_indirect((UnitType)s_units[s_selected].type) &&
+               s_groups[s_group] == GRP_ATTACK) {
+      // "Fire from here" - skip the distance list entirely.
+      s_moved = false;
+      build_actions(s_selected, false);
+      if (s_action_count == 1)              finish_action();
+      else if (s_actions[0] == ACT_ATTACK) { s_target = 0; s_phase = PHASE_TARGET; }
+      else                                  s_phase = PHASE_ACTION;
+    } else {
       build_dests_for_group(s_groups[s_group]);
       s_phase = PHASE_MOVE;
     }
@@ -1613,7 +1679,7 @@ static void select_handler(ClickRecognizerRef r, void *context) {
     }
 
   } else if (s_phase == PHASE_TARGET) {
-    resolve_attack(s_selected, s_targets[s_target]);
+    resolve_attack(s_selected, s_targets[s_target], s_moved);
     finish_action();
   }
   layer_mark_dirty(s_canvas);
@@ -1647,8 +1713,13 @@ static void back_handler(ClickRecognizerRef r, void *context) {
     case PHASE_MOVE:
       s_phase = PHASE_GROUP;
       break;
-    case PHASE_ACTION:
     case PHASE_TARGET:
+      // Backing out of a shot returns to the action list instead of burning
+      // the unit's turn.
+      if (s_action_count > 1) s_phase = PHASE_ACTION;
+      else                    finish_action();
+      break;
+    case PHASE_ACTION:
       finish_action();
       break;
     case PHASE_ENEMY:
