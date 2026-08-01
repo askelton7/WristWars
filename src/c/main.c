@@ -2,7 +2,7 @@
 #include <string.h>
 
 // ===========================================================================
-//  WristWars - step 9: capture objectives, HQ victory, in-app menu
+//  WristWars - step 10: levels, campaign, unit icons, front-end menus
 // ===========================================================================
 
 #define GRID_W    10
@@ -15,25 +15,131 @@
 #define AI_STEP_MS  450
 #define CAPTURE_GOAL 20
 
-#define SAVE_VERSION     4
+#define SAVE_VERSION     5
 #define PERSIST_KEY_SAVE 1
+#define PERSIST_KEY_PROG 2
 
-// ---- Terrain --------------------------------------------------------------
+typedef enum { U_INFANTRY = 0, U_BAZOOKA, U_TANK, U_ARTILLERY } UnitType;
+
+typedef struct { uint8_t type, team, x, y; } Deploy;
+
+typedef struct {
+  const char  *name;
+  const char  *rows[GRID_H];
+  const Deploy *deploys;
+  uint8_t      deploy_count;
+  bool         campaign;
+  bool         skirmish;
+  const char  *hint;
+} Level;
+
+// ---- Maps -----------------------------------------------------------------
 //   .  = plains     F = forest     M = mountain    w = water
 //   c  = city       h = your HQ    e = enemy HQ
 
-static const char *MAP[GRID_H] = {
-  ".......F..",
-  "..c.....e.",
-  "...cM.F...",
-  ".F.ww...F.",
-  "..Mwww.c.F",
-  "F.c.wwwM..",
-  ".F...ww.F.",
-  "...F.Mc...",
-  ".h.....c..",
-  "..F.......",
+static const Deploy s_dep0[] = { { U_INFANTRY, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }, { U_INFANTRY, 1, 7, 2 } };
+static const Deploy s_dep1[] = { { U_INFANTRY, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }, { U_BAZOOKA, 0, 1, 7 }, { U_INFANTRY, 1, 3, 2 }, { U_INFANTRY, 1, 4, 3 } };
+static const Deploy s_dep2[] = { { U_BAZOOKA, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }, { U_INFANTRY, 0, 1, 7 }, { U_TANK, 1, 7, 2 }, { U_INFANTRY, 1, 8, 3 } };
+static const Deploy s_dep3[] = { { U_ARTILLERY, 0, 4, 7 }, { U_INFANTRY, 0, 2, 7 }, { U_BAZOOKA, 0, 6, 7 }, { U_INFANTRY, 1, 4, 2 }, { U_INFANTRY, 1, 6, 2 }, { U_TANK, 1, 2, 2 } };
+static const Deploy s_dep4[] = { { U_INFANTRY, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }, { U_BAZOOKA, 0, 1, 7 }, { U_TANK, 0, 3, 8 }, { U_INFANTRY, 1, 8, 1 }, { U_INFANTRY, 1, 7, 1 }, { U_BAZOOKA, 1, 8, 2 }, { U_TANK, 1, 6, 1 } };
+static const Deploy s_dep5[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 }, { U_BAZOOKA, 0, 0, 8 }, { U_TANK, 0, 2, 8 }, { U_ARTILLERY, 0, 1, 7 }, { U_INFANTRY, 1, 9, 0 }, { U_INFANTRY, 1, 8, 0 }, { U_BAZOOKA, 1, 9, 1 }, { U_TANK, 1, 7, 1 }, { U_ARTILLERY, 1, 8, 2 } };
+static const Deploy s_dep6[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 }, { U_BAZOOKA, 0, 2, 9 }, { U_TANK, 0, 0, 8 }, { U_ARTILLERY, 0, 2, 8 }, { U_INFANTRY, 1, 9, 0 }, { U_INFANTRY, 1, 8, 0 }, { U_BAZOOKA, 1, 7, 0 }, { U_TANK, 1, 9, 1 }, { U_ARTILLERY, 1, 7, 1 } };
+
+static const Level LEVELS[] = {
+  { "First Contact", {
+      "..........",
+      "..........",
+      "....F.....",
+      "..........",
+      "...FF.....",
+      ".....FF...",
+      "..........",
+      ".....F....",
+      "..........",
+      ".........." },
+    s_dep0, ARRAY_LENGTH(s_dep0), true, false, "Move and attack. Wipe them out." },
+  { "High Ground", {
+      "..........",
+      "..........",
+      "...MM.....",
+      "...MM.....",
+      "..........",
+      "....FF....",
+      "..........",
+      "..........",
+      "..........",
+      ".........." },
+    s_dep1, ARRAY_LENGTH(s_dep1), true, false, "Mountains cut damage 40%." },
+  { "Armour", {
+      "..........",
+      "....ww....",
+      "....ww....",
+      "..........",
+      "..F....F..",
+      "..........",
+      "..F....F..",
+      "..........",
+      "..........",
+      ".........." },
+    s_dep2, ARRAY_LENGTH(s_dep2), true, false, "Bazookas shred armour." },
+  { "Shellfire", {
+      "..........",
+      "..........",
+      "..........",
+      "..........",
+      ".wwww.www.",
+      "..........",
+      "..F....F..",
+      "..........",
+      "..........",
+      ".........." },
+    s_dep3, ARRAY_LENGTH(s_dep3), true, false, "Artillery must hold still to fire." },
+  { "Take the City", {
+      "..........",
+      "..c....c..",
+      "..........",
+      "...FF.....",
+      "..........",
+      "..........",
+      ".....FF...",
+      "..c....c..",
+      "..........",
+      ".........." },
+    s_dep4, ARRAY_LENGTH(s_dep4), true, false, "Cities heal. Infantry capture." },
+  { "Headquarters", {
+      ".......F..",
+      "..c.....e.",
+      "...cM.F...",
+      ".F.ww...F.",
+      "..Mwww.c.F",
+      "F.c.wwwM..",
+      ".F...ww.F.",
+      "...F.Mc...",
+      ".h.....c..",
+      "..F......." },
+    s_dep5, ARRAY_LENGTH(s_dep5), true, true, "Take their HQ, or wipe them out." },
+  { "Crossroads", {
+      "..........",
+      ".....F..e.",
+      ".F...c....",
+      "..cw...F..",
+      "M..wM.w.c.",
+      ".c.w.Mw..M",
+      "..F...wc..",
+      "....c...F.",
+      ".h..F.....",
+      ".........." },
+    s_dep6, ARRAY_LENGTH(s_dep6), false, true, "Three lanes. Pick one." },
 };
+
+#define LEVEL_COUNT ((int)ARRAY_LENGTH(LEVELS))
+
+static int  s_level_idx = 5;
+static bool s_campaign   = false;
+
+static const Level *cur(void) { return &LEVELS[s_level_idx]; }
+
+// ---- Terrain --------------------------------------------------------------
 
 typedef enum {
   T_PLAINS = 0, T_FOREST, T_MOUNTAIN, T_WATER, T_CITY, T_HQ
@@ -45,7 +151,7 @@ static const char *TERRAIN_NAMES[] = {
 static const int TERRAIN_DEF[] = { 0, 1, 2, 0, 1, 2 };
 
 static Terrain terrain_at(int x, int y) {
-  switch (MAP[y][x]) {
+  switch (cur()->rows[y][x]) {
     case 'F': return T_FOREST;
     case 'M': return T_MOUNTAIN;
     case 'w': return T_WATER;
@@ -67,20 +173,13 @@ static GColor terrain_color(Terrain t) {
 }
 
 // ---- Capturable sites -----------------------------------------------------
-// Ownership and capture progress live here rather than in the map, which is
-// const. Only these tiles need tracking, which keeps the save small.
 
 #define SITE_CITY 0
 #define SITE_HQ   1
 #define OWNER_NEUTRAL 2
 
 typedef struct {
-  uint8_t x, y;
-  uint8_t kind;
-  uint8_t owner;      // 0 you, 1 enemy, 2 neutral
-  uint8_t progress;   // toward CAPTURE_GOAL
-  uint8_t cap_team;   // who is part-way through capturing
-  uint8_t home;       // for an HQ, who it started as
+  uint8_t x, y, kind, owner, progress, cap_team, home;
 } Site;
 
 static Site s_sites[MAX_SITES];
@@ -90,7 +189,7 @@ static void init_sites(void) {
   s_site_count = 0;
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
-      char c = MAP[y][x];
+      char c = cur()->rows[y][x];
       if (c != 'c' && c != 'h' && c != 'e') continue;
       if (s_site_count >= MAX_SITES) continue;
 
@@ -118,12 +217,9 @@ static int site_at(int x, int y) {
 
 // ---- Units ----------------------------------------------------------------
 
-typedef enum { U_INFANTRY = 0, U_BAZOOKA, U_TANK, U_ARTILLERY } UnitType;
-
-static const char *UNIT_NAMES[]   = { "Infantry", "Bazooka", "Tank", "Artillery" };
-static const char *UNIT_LETTERS[] = { "I", "B", "T", "A" };
-static const int   UNIT_MOVE[]    = {  3,   2,   6,   2  };
-static const int   UNIT_VALUE[]   = {  1,   2,   3,   3  };
+static const char *UNIT_NAMES[] = { "Infantry", "Bazooka", "Tank", "Artillery" };
+static const int   UNIT_MOVE[]  = {  3,   2,   6,   2  };
+static const int   UNIT_VALUE[] = {  1,   2,   3,   3  };
 
 static const int DMG[4][4] = {
   //        Inf  Bzka Tank Arty
@@ -163,27 +259,16 @@ static int dist_between(const Unit *a, const Unit *b) {
   return dist_xy(a->x, a->y, b->x, b->y);
 }
 
-static void add_unit(UnitType type, int team, int x, int y) {
-  if (s_unit_count >= MAX_UNITS) return;
-  Unit *u = &s_units[s_unit_count++];
-  u->type = type; u->team = team;
-  u->x = x; u->y = y;
-  u->hp = 10; u->acted = false; u->alive = true;
-}
-
-static void setup_units(void) {
+static void setup_units_from_level(void) {
+  const Level *lv = cur();
   s_unit_count = 0;
-  add_unit(U_INFANTRY,  0, 0, 9);
-  add_unit(U_INFANTRY,  0, 1, 9);
-  add_unit(U_BAZOOKA,   0, 0, 8);
-  add_unit(U_TANK,      0, 2, 8);
-  add_unit(U_ARTILLERY, 0, 1, 7);
-
-  add_unit(U_INFANTRY,  1, 9, 0);
-  add_unit(U_INFANTRY,  1, 8, 0);
-  add_unit(U_BAZOOKA,   1, 9, 1);
-  add_unit(U_TANK,      1, 7, 1);
-  add_unit(U_ARTILLERY, 1, 8, 2);
+  for (int i = 0; i < lv->deploy_count && s_unit_count < MAX_UNITS; i++) {
+    const Deploy *d = &lv->deploys[i];
+    Unit *u = &s_units[s_unit_count++];
+    u->type = d->type; u->team = d->team;
+    u->x = d->x; u->y = d->y;
+    u->hp = 10; u->acted = false; u->alive = true;
+  }
 }
 
 static int unit_at(int x, int y) {
@@ -203,7 +288,7 @@ static int count_alive(int team) {
 
 static bool can_capture_here(int ui) {
   Unit *u = &s_units[ui];
-  if (u->type != U_INFANTRY) return false;      // only boots take ground
+  if (u->type != U_INFANTRY) return false;
   int si = site_at(u->x, u->y);
   return (si >= 0 && s_sites[si].owner != u->team);
 }
@@ -234,7 +319,7 @@ static void clear_capture_at(int x, int y) {
 static void kill_unit(Unit *u) {
   u->hp = 0;
   u->alive = false;
-  clear_capture_at(u->x, u->y);      // a dead capturer loses its progress
+  clear_capture_at(u->x, u->y);
   if (u->team == 0) s_lost_player++;
   else              s_lost_enemy++;
 }
@@ -260,7 +345,6 @@ static void resolve_attack(int ai, int di) {
   else if (player_hurt) vibes_short_pulse();
 }
 
-// A full-health infantry needs two turns; a damaged one takes longer.
 static void do_capture(int ui) {
   Unit *u = &s_units[ui];
   int si = site_at(u->x, u->y);
@@ -287,7 +371,7 @@ static int move_cost(UnitType type, Terrain ter) {
     case T_WATER:    return -1;
     case T_MOUNTAIN: return (type == U_INFANTRY || type == U_BAZOOKA) ? 3 : -1;
     case T_FOREST:   return 2;
-    default:         return 1;      // plains, city, HQ
+    default:         return 1;
   }
 }
 
@@ -431,11 +515,8 @@ static void classify_reach(int ui) {
       if (!tile_free(x, y, ui)) continue;
 
       int grp;
-      if (!is_indirect(u->type) && adjacent_to_enemy(x, y, u->team)) {
-        grp = GRP_ATTACK;
-      } else {
-        grp = heading_of(x - u->x, y - u->y);
-      }
+      if (!is_indirect(u->type) && adjacent_to_enemy(x, y, u->team)) grp = GRP_ATTACK;
+      else                                                          grp = heading_of(x - u->x, y - u->y);
 
       s_reach[s_reach_count].x = x;
       s_reach[s_reach_count].y = y;
@@ -473,7 +554,6 @@ static void build_dests_for_group(int g) {
   s_dest_count = 0;
   for (int i = 0; i < s_reach_count; i++) {
     if (s_reach_grp[i] != g) continue;
-
     int c = s_reach_cost[i];
     int j = s_dest_count - 1;
     while (j >= 0 && s_cost[s_dests[j].y][s_dests[j].x] < c) {
@@ -525,27 +605,73 @@ static void build_actions(int ui, bool moved) {
   s_action = 0;
 }
 
+// ---- Campaign progress ----------------------------------------------------
+
+static uint32_t s_progress = 0;
+static uint8_t  s_camp[LEVEL_COUNT];
+static int      s_camp_count = 0;
+
+static void build_campaign_list(void) {
+  s_camp_count = 0;
+  for (int i = 0; i < LEVEL_COUNT; i++) {
+    if (LEVELS[i].campaign) s_camp[s_camp_count++] = (uint8_t)i;
+  }
+}
+
+static void load_progress(void) {
+  if (persist_exists(PERSIST_KEY_PROG)) {
+    s_progress = (uint32_t)persist_read_int(PERSIST_KEY_PROG);
+  }
+}
+
+static void save_progress(void) {
+  persist_write_int(PERSIST_KEY_PROG, (int)s_progress);
+}
+
+static bool level_cleared(int idx) { return (s_progress >> idx) & 1u; }
+
+static bool camp_unlocked(int ci) {
+  if (ci <= 0) return true;
+  return level_cleared(s_camp[ci - 1]);
+}
+
 // ---- Game state -----------------------------------------------------------
 
 typedef enum {
-  PHASE_BROWSE = 0, PHASE_GROUP, PHASE_MOVE, PHASE_ACTION,
-  PHASE_TARGET, PHASE_ENEMY, PHASE_OVER, PHASE_MENU,
+  PHASE_MAIN = 0, PHASE_LEVELS, PHASE_PAUSE,
+  PHASE_BROWSE, PHASE_GROUP, PHASE_MOVE, PHASE_ACTION,
+  PHASE_TARGET, PHASE_ENEMY, PHASE_OVER,
 } Phase;
-
-static const char *MENU_ITEMS[] = { "Resume", "New game", "Exit" };
-#define MENU_COUNT 3
 
 static Window   *s_window;
 static Layer    *s_canvas;
 static AppTimer *s_ai_timer = NULL;
 
-static Phase s_phase       = PHASE_BROWSE;
+static Phase s_phase       = PHASE_MAIN;
 static bool  s_confirm_end = false;
-static int   s_menu        = 0;
 static int   s_browse      = 0;
 static int   s_selected    = -1;
 static bool  s_moved       = false;
 static int   s_winner      = -1;
+
+// Front-end menus
+#define MM_CONTINUE 0
+#define MM_CAMPAIGN 1
+#define MM_SKIRMISH 2
+#define MM_EXIT     3
+
+static char    s_mm_label[4][14];
+static uint8_t s_mm_act[4];
+static int     s_mm_count = 0;
+static int     s_mm_sel   = 0;
+static bool    s_have_save = false;
+
+static char s_lv_label[LEVEL_COUNT][22];
+static int  s_lv_sel = 0;
+
+static const char *PAUSE_ITEMS[] = { "Resume", "Restart", "Main menu" };
+#define PAUSE_COUNT 3
+static int s_pause_sel = 0;
 
 static Unit s_undo_units[MAX_UNITS];
 static Site s_undo_sites[MAX_SITES];
@@ -563,17 +689,53 @@ static void snapshot_for_undo(void) {
   s_undo_ok = true;
 }
 
+static void build_main_menu(void) {
+  s_mm_count = 0;
+  if (s_have_save) {
+    strncpy(s_mm_label[s_mm_count], "Continue", sizeof(s_mm_label[0]) - 1);
+    s_mm_act[s_mm_count++] = MM_CONTINUE;
+  }
+  strncpy(s_mm_label[s_mm_count], "Campaign", sizeof(s_mm_label[0]) - 1);
+  s_mm_act[s_mm_count++] = MM_CAMPAIGN;
+  strncpy(s_mm_label[s_mm_count], "Skirmish", sizeof(s_mm_label[0]) - 1);
+  s_mm_act[s_mm_count++] = MM_SKIRMISH;
+  strncpy(s_mm_label[s_mm_count], "Exit", sizeof(s_mm_label[0]) - 1);
+  s_mm_act[s_mm_count++] = MM_EXIT;
+  if (s_mm_sel >= s_mm_count) s_mm_sel = 0;
+}
+
+static void build_level_menu(void) {
+  for (int ci = 0; ci < s_camp_count; ci++) {
+    int idx = s_camp[ci];
+    const char *mark = "";
+    if (level_cleared(idx))      mark = " done";
+    else if (!camp_unlocked(ci)) mark = " lock";
+    snprintf(s_lv_label[ci], sizeof(s_lv_label[0]), "%d %s%s",
+             ci + 1, LEVELS[idx].name, mark);
+  }
+  if (s_lv_sel >= s_camp_count) s_lv_sel = 0;
+}
+
 static void check_game_over(void) {
   for (int i = 0; i < s_site_count; i++) {
     if (s_sites[i].kind != SITE_HQ) continue;
-    if (s_sites[i].owner != s_sites[i].home) {     // an HQ changed hands
+    if (s_sites[i].owner != s_sites[i].home) {
       s_winner = s_sites[i].owner;
       s_phase = PHASE_OVER;
-      return;
+      break;
     }
   }
-  if (count_alive(1) == 0)      { s_winner = 0; s_phase = PHASE_OVER; }
-  else if (count_alive(0) == 0) { s_winner = 1; s_phase = PHASE_OVER; }
+  if (s_phase != PHASE_OVER) {
+    if (count_alive(1) == 0)      { s_winner = 0; s_phase = PHASE_OVER; }
+    else if (count_alive(0) == 0) { s_winner = 1; s_phase = PHASE_OVER; }
+  }
+
+  if (s_phase == PHASE_OVER && s_winner == 0 && s_campaign &&
+      !level_cleared(s_level_idx)) {
+    s_progress |= (1u << s_level_idx);
+    save_progress();
+    build_level_menu();
+  }
 }
 
 static bool all_player_used(void) {
@@ -608,7 +770,6 @@ static void cycle_own_unit(int dir) {
   }
 }
 
-// Stalled captures decay, and units resting on ground you hold recover.
 static void turn_upkeep(int team) {
   for (int i = 0; i < s_site_count; i++) {
     Site *s = &s_sites[i];
@@ -619,7 +780,6 @@ static void turn_upkeep(int team) {
       s->cap_team = OWNER_NEUTRAL;
     }
   }
-
   for (int i = 0; i < s_unit_count; i++) {
     Unit *u = &s_units[i];
     if (!u->alive || u->team != team || u->hp >= 10) continue;
@@ -641,12 +801,15 @@ typedef struct {
   uint16_t turn;
   uint8_t  lost_player;
   uint8_t  lost_enemy;
+  uint8_t  level;
+  uint8_t  campaign;
+  uint8_t  pad0, pad1;
   Unit     units[MAX_UNITS];
   Site     sites[MAX_SITES];
 } SaveBlob;
 
 static void save_game(void) {
-  if (s_phase == PHASE_ENEMY) return;      // never persist a half-done AI turn
+  if (s_phase == PHASE_ENEMY) return;
 
   SaveBlob b;
   memset(&b, 0, sizeof(b));
@@ -657,6 +820,8 @@ static void save_game(void) {
   b.turn        = (uint16_t)s_turn;
   b.lost_player = (uint8_t)s_lost_player;
   b.lost_enemy  = (uint8_t)s_lost_enemy;
+  b.level       = (uint8_t)s_level_idx;
+  b.campaign    = s_campaign ? 1 : 0;
   memcpy(b.units, s_units, sizeof(s_units));
   memcpy(b.sites, s_sites, sizeof(s_sites));
   persist_write_data(PERSIST_KEY_SAVE, &b, sizeof(b));
@@ -670,8 +835,11 @@ static bool load_game(void) {
   if (n != (int)sizeof(b)) return false;
   if (b.version != SAVE_VERSION) return false;
   if (b.unit_count == 0 || b.unit_count > MAX_UNITS) return false;
-  if (b.site_count == 0 || b.site_count > MAX_SITES) return false;
+  if (b.site_count > MAX_SITES) return false;
+  if (b.level >= LEVEL_COUNT) return false;
 
+  s_level_idx   = b.level;
+  s_campaign    = (b.campaign != 0);
   s_unit_count  = b.unit_count;
   s_site_count  = b.site_count;
   memcpy(s_units, b.units, sizeof(s_units));
@@ -727,7 +895,6 @@ static void ai_act(int ui) {
     u->x = x; u->y = y;
     int def_bonus = TERRAIN_DEF[terrain_at(x, y)] * 15;
 
-    // Shots
     if (!(is_indirect(u->type) && moved)) {
       for (int i = 0; i < s_unit_count; i++) {
         if (!s_units[i].alive || s_units[i].team == u->team) continue;
@@ -752,14 +919,13 @@ static void ai_act(int ui) {
       }
     }
 
-    // Ground worth taking
     int si = site_at(x, y);
     if (si >= 0 && u->type == U_INFANTRY && s_sites[si].owner != u->team) {
       Site *s = &s_sites[si];
       int score;
       if (s->kind == SITE_HQ) {
         bool finishes = (s->cap_team == u->team && s->progress + u->hp >= CAPTURE_GOAL);
-        score = finishes ? 6000 : 2600;        // taking the HQ ends the match
+        score = finishes ? 6000 : 2600;
       } else {
         score = 850 + s->progress * 8;
       }
@@ -770,7 +936,6 @@ static void ai_act(int ui) {
       }
     }
 
-    // Otherwise close the distance
     int approach = -nearest_foe_dist(x, y, u->team) * 10 + def_bonus / 3;
     if (approach > best_score) {
       best_score = approach; best_x = x; best_y = y;
@@ -779,8 +944,8 @@ static void ai_act(int ui) {
   }
 
   u->x = best_x; u->y = best_y;
-  if (best_target >= 0)   resolve_attack(ui, best_target);
-  else if (best_capture)  do_capture(ui);
+  if (best_target >= 0)  resolve_attack(ui, best_target);
+  else if (best_capture) do_capture(ui);
   u->acted = true;
 }
 
@@ -841,10 +1006,12 @@ static void begin_enemy_turn(void) {
   schedule_ai();
 }
 
-static void new_game(void) {
+static void start_level(int idx, bool campaign) {
   if (s_ai_timer) { app_timer_cancel(s_ai_timer); s_ai_timer = NULL; }
+  s_level_idx = idx;
+  s_campaign  = campaign;
   init_sites();
-  setup_units();
+  setup_units_from_level();
   s_turn = 1;
   s_lost_player = 0;
   s_lost_enemy = 0;
@@ -856,7 +1023,15 @@ static void new_game(void) {
   s_phase = PHASE_BROWSE;
   focus_next_unacted(s_unit_count - 1);
   recompute_threat();
-  save_game();
+}
+
+static void start_skirmish(void) {
+  uint8_t pool[LEVEL_COUNT];
+  int n = 0;
+  for (int i = 0; i < LEVEL_COUNT; i++) if (LEVELS[i].skirmish) pool[n++] = (uint8_t)i;
+  if (n == 0) { start_level(0, false); return; }
+  int pick = pool[(int)(time(NULL) % (unsigned)n)];
+  start_level(pick, false);
 }
 
 // ---- Drawing --------------------------------------------------------------
@@ -893,7 +1068,6 @@ static void draw_terrain_mark(GContext *ctx, Terrain ter, int px, int py) {
   }
 }
 
-// A flag on every capturable tile, coloured by who holds it.
 static void draw_site_flag(GContext *ctx, const Site *s, int px, int py) {
   int pole = px + 4;
   graphics_context_set_stroke_color(ctx, GColorBlack);
@@ -904,11 +1078,49 @@ static void draw_site_flag(GContext *ctx, const Site *s, int px, int py) {
   graphics_context_set_stroke_color(ctx, GColorBlack);
   graphics_draw_rect(ctx, GRect(pole + 1, py + 3, 7, 5));
 
-  if (s->kind == SITE_HQ) {   // a second bar marks the important one
+  if (s->kind == SITE_HQ) {
     graphics_context_set_fill_color(ctx, owner_color(s->owner));
     graphics_fill_rect(ctx, GRect(pole + 1, py + 9, 5, 3), 0, GCornerNone);
     graphics_context_set_stroke_color(ctx, GColorBlack);
     graphics_draw_rect(ctx, GRect(pole + 1, py + 9, 5, 3));
+  }
+}
+
+// Silhouettes instead of letters. Kept inside py+3..py+11 so the health bar
+// underneath stays clear.
+static void draw_unit_icon(GContext *ctx, UnitType t, int px, int py, GColor ink) {
+  int cx = px + TILE / 2;
+  graphics_context_set_fill_color(ctx, ink);
+  graphics_context_set_stroke_color(ctx, ink);
+
+  switch (t) {
+    case U_INFANTRY:                                  // helmet and shoulders
+      graphics_fill_circle(ctx, GPoint(cx, py + 5), 2);
+      graphics_fill_rect(ctx, GRect(cx - 3, py + 8, 7, 3), 1, GCornersAll);
+      break;
+
+    case U_BAZOOKA:                                   // same, with a tube
+      graphics_fill_circle(ctx, GPoint(cx - 1, py + 5), 2);
+      graphics_fill_rect(ctx, GRect(cx - 4, py + 8, 7, 3), 1, GCornersAll);
+      graphics_context_set_stroke_width(ctx, 2);
+      graphics_draw_line(ctx, GPoint(cx - 4, py + 9), GPoint(cx + 4, py + 3));
+      graphics_context_set_stroke_width(ctx, 1);
+      break;
+
+    case U_TANK:                                      // hull, turret, barrel
+      graphics_fill_rect(ctx, GRect(cx - 5, py + 7, 10, 4), 1, GCornersAll);
+      graphics_fill_rect(ctx, GRect(cx - 2, py + 4, 4, 3), 1, GCornersAll);
+      graphics_context_set_stroke_width(ctx, 2);
+      graphics_draw_line(ctx, GPoint(cx + 2, py + 5), GPoint(cx + 5, py + 5));
+      graphics_context_set_stroke_width(ctx, 1);
+      break;
+
+    case U_ARTILLERY:                                 // carriage and long gun
+      graphics_fill_rect(ctx, GRect(cx - 5, py + 8, 10, 3), 1, GCornersAll);
+      graphics_context_set_stroke_width(ctx, 2);
+      graphics_draw_line(ctx, GPoint(cx - 3, py + 9), GPoint(cx + 4, py + 3));
+      graphics_context_set_stroke_width(ctx, 1);
+      break;
   }
 }
 
@@ -932,11 +1144,7 @@ static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
   graphics_context_set_stroke_color(ctx, GColorBlack);
   graphics_draw_round_rect(ctx, box, 3);
 
-  graphics_context_set_text_color(ctx, ink);
-  graphics_draw_text(ctx, UNIT_LETTERS[u->type],
-                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                     GRect(px, py - 2, TILE, TILE),
-                     GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  draw_unit_icon(ctx, (UnitType)u->type, px, py, ink);
 
   if (u->hp < 10) {
     int w = (TILE - 8) * u->hp / 10;
@@ -947,7 +1155,6 @@ static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
   }
 }
 
-// Describe a tile including who owns it, if anyone.
 static void tile_label(int x, int y, char *buf, int len) {
   Terrain t = terrain_at(x, y);
   int si = site_at(x, y);
@@ -961,15 +1168,26 @@ static void tile_label(int x, int y, char *buf, int len) {
   snprintf(buf, len, "%s %s +%d%%", TERRAIN_NAMES[t], who, TERRAIN_DEF[t] * 20);
 }
 
-static void canvas_update(Layer *layer, GContext *ctx) {
-  GRect bounds = layer_get_bounds(layer);
+// A vertical list used by all three menus.
+static void draw_menu_list(GContext *ctx, GRect area, int row_h,
+                           const char *items, int stride, int count, int sel,
+                           const char *font_key) {
+  for (int i = 0; i < count; i++) {
+    GRect row = GRect(area.origin.x, area.origin.y + i * row_h, area.size.w, row_h - 2);
+    if (i == sel) {
+      graphics_context_set_fill_color(ctx, GColorYellow);
+      graphics_fill_rect(ctx, row, 3, GCornersAll);
+      graphics_context_set_text_color(ctx, GColorBlack);
+    } else {
+      graphics_context_set_text_color(ctx, GColorWhite);
+    }
+    graphics_draw_text(ctx, items + i * stride, fonts_get_system_font(font_key),
+                       GRect(row.origin.x + 4, row.origin.y, row.size.w - 8, row_h - 2),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  }
+}
 
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-
-  int ox = (bounds.size.w - (GRID_W * TILE)) / 2;
-  int oy = 2;
-
+static void draw_board(GContext *ctx, GRect bounds, int ox, int oy) {
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
       int px = ox + x * TILE;
@@ -991,6 +1209,48 @@ static void canvas_update(Layer *layer, GContext *ctx) {
       graphics_draw_rect(ctx, GRect(px, py, TILE, TILE));
     }
   }
+  (void)bounds;
+}
+
+static void canvas_update(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  // ---- Front-end screens ----
+  if (s_phase == PHASE_MAIN) {
+    graphics_context_set_text_color(ctx, GColorYellow);
+    graphics_draw_text(ctx, "WRISTWARS", fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+                       GRect(0, 14, bounds.size.w, 30),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    draw_menu_list(ctx, GRect(24, 64, bounds.size.w - 48, 0), 32,
+                   (const char *)s_mm_label, (int)sizeof(s_mm_label[0]),
+                   s_mm_count, s_mm_sel, FONT_KEY_GOTHIC_18);
+    return;
+  }
+
+  if (s_phase == PHASE_LEVELS) {
+    graphics_context_set_text_color(ctx, GColorYellow);
+    graphics_draw_text(ctx, "Campaign", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                       GRect(0, 6, bounds.size.w, 22),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    draw_menu_list(ctx, GRect(8, 32, bounds.size.w - 16, 0), 27,
+                   (const char *)s_lv_label, (int)sizeof(s_lv_label[0]),
+                   s_camp_count, s_lv_sel, FONT_KEY_GOTHIC_18);
+
+    graphics_context_set_text_color(ctx, GColorLightGray);
+    graphics_draw_text(ctx, LEVELS[s_camp[s_lv_sel]].hint,
+                       fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(6, bounds.size.h - 40, bounds.size.w - 12, 36),
+                       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    return;
+  }
+
+  // ---- The board ----
+  int ox = (bounds.size.w - (GRID_W * TILE)) / 2;
+  int oy = 2;
+  draw_board(ctx, bounds, ox, oy);
 
   if (s_phase == PHASE_GROUP && s_group_count > 0) {
     int g = s_groups[s_group];
@@ -1014,7 +1274,6 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     if (s_units[i].alive) draw_unit(ctx, i, ox, oy);
   }
 
-  // Capture progress sits above the unit so it stays readable.
   for (int i = 0; i < s_site_count; i++) {
     Site *s = &s_sites[i];
     if (s->progress == 0) continue;
@@ -1112,6 +1371,8 @@ static void canvas_update(Layer *layer, GContext *ctx) {
              UNIT_NAMES[u->type], u->hp, u->acted ? " used" : "");
     if (s_confirm_end) {
       snprintf(s_line2, sizeof(s_line2), "Hold Select again to end");
+    } else if (s_turn == 1) {
+      snprintf(s_line2, sizeof(s_line2), "%s", cur()->hint);
     } else if (all_player_used()) {
       snprintf(s_line2, sizeof(s_line2), "T%d  all used: hold Select", s_turn);
     } else {
@@ -1130,25 +1391,24 @@ static void canvas_update(Layer *layer, GContext *ctx) {
                      GRect(0, top + 21, bounds.size.w, 18),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
-  // Menu overlay, drawn last so the board stays visible behind it.
-  if (s_phase == PHASE_MENU) {
-    GRect panel = GRect(22, 52, bounds.size.w - 44, 92);
+  if (s_phase == PHASE_PAUSE) {
+    GRect panel = GRect(22, 52, bounds.size.w - 44, 94);
     graphics_context_set_fill_color(ctx, GColorBlack);
     graphics_fill_rect(ctx, panel, 5, GCornersAll);
     graphics_context_set_stroke_color(ctx, GColorWhite);
     graphics_draw_round_rect(ctx, panel, 5);
 
-    for (int i = 0; i < MENU_COUNT; i++) {
+    for (int i = 0; i < PAUSE_COUNT; i++) {
       GRect row = GRect(panel.origin.x + 5, panel.origin.y + 7 + i * 27,
                         panel.size.w - 10, 24);
-      if (i == s_menu) {
+      if (i == s_pause_sel) {
         graphics_context_set_fill_color(ctx, GColorYellow);
         graphics_fill_rect(ctx, row, 3, GCornersAll);
         graphics_context_set_text_color(ctx, GColorBlack);
       } else {
         graphics_context_set_text_color(ctx, GColorWhite);
       }
-      graphics_draw_text(ctx, MENU_ITEMS[i], fonts_get_system_font(FONT_KEY_GOTHIC_18),
+      graphics_draw_text(ctx, PAUSE_ITEMS[i], fonts_get_system_font(FONT_KEY_GOTHIC_18),
                          row, GTextOverflowModeTrailingEllipsis,
                          GTextAlignmentCenter, NULL);
     }
@@ -1168,44 +1428,60 @@ static void finish_action(void) {
   save_game();
 }
 
+static void go_main_menu(void) {
+  if (s_ai_timer) { app_timer_cancel(s_ai_timer); s_ai_timer = NULL; }
+  s_have_save = (s_winner < 0);
+  build_main_menu();
+  s_phase = PHASE_MAIN;
+}
+
 static void up_handler(ClickRecognizerRef r, void *context) {
   s_confirm_end = false;
-  if (s_phase == PHASE_MENU) {
-    s_menu = (s_menu + MENU_COUNT - 1) % MENU_COUNT;
-  } else if (s_phase == PHASE_GROUP && s_group_count > 0) {
-    s_group = (s_group + s_group_count - 1) % s_group_count;
-  } else if (s_phase == PHASE_MOVE && s_dest_count > 0) {
-    s_dest = (s_dest + s_dest_count - 1) % s_dest_count;
-  } else if (s_phase == PHASE_ACTION) {
-    s_action = (s_action + s_action_count - 1) % s_action_count;
-  } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
-    s_target = (s_target + s_target_count - 1) % s_target_count;
-  } else if (s_phase == PHASE_BROWSE) {
-    cycle_own_unit(-1);
+  switch (s_phase) {
+    case PHASE_MAIN:   s_mm_sel = (s_mm_sel + s_mm_count - 1) % s_mm_count; break;
+    case PHASE_LEVELS: s_lv_sel = (s_lv_sel + s_camp_count - 1) % s_camp_count; break;
+    case PHASE_PAUSE:  s_pause_sel = (s_pause_sel + PAUSE_COUNT - 1) % PAUSE_COUNT; break;
+    case PHASE_GROUP:
+      if (s_group_count > 0) s_group = (s_group + s_group_count - 1) % s_group_count;
+      break;
+    case PHASE_MOVE:
+      if (s_dest_count > 0) s_dest = (s_dest + s_dest_count - 1) % s_dest_count;
+      break;
+    case PHASE_ACTION: s_action = (s_action + s_action_count - 1) % s_action_count; break;
+    case PHASE_TARGET:
+      if (s_target_count > 0) s_target = (s_target + s_target_count - 1) % s_target_count;
+      break;
+    case PHASE_BROWSE: cycle_own_unit(-1); break;
+    default: break;
   }
   layer_mark_dirty(s_canvas);
 }
 
 static void down_handler(ClickRecognizerRef r, void *context) {
   s_confirm_end = false;
-  if (s_phase == PHASE_MENU) {
-    s_menu = (s_menu + 1) % MENU_COUNT;
-  } else if (s_phase == PHASE_GROUP && s_group_count > 0) {
-    s_group = (s_group + 1) % s_group_count;
-  } else if (s_phase == PHASE_MOVE && s_dest_count > 0) {
-    s_dest = (s_dest + 1) % s_dest_count;
-  } else if (s_phase == PHASE_ACTION) {
-    s_action = (s_action + 1) % s_action_count;
-  } else if (s_phase == PHASE_TARGET && s_target_count > 0) {
-    s_target = (s_target + 1) % s_target_count;
-  } else if (s_phase == PHASE_BROWSE) {
-    cycle_own_unit(1);
+  switch (s_phase) {
+    case PHASE_MAIN:   s_mm_sel = (s_mm_sel + 1) % s_mm_count; break;
+    case PHASE_LEVELS: s_lv_sel = (s_lv_sel + 1) % s_camp_count; break;
+    case PHASE_PAUSE:  s_pause_sel = (s_pause_sel + 1) % PAUSE_COUNT; break;
+    case PHASE_GROUP:
+      if (s_group_count > 0) s_group = (s_group + 1) % s_group_count;
+      break;
+    case PHASE_MOVE:
+      if (s_dest_count > 0) s_dest = (s_dest + 1) % s_dest_count;
+      break;
+    case PHASE_ACTION: s_action = (s_action + 1) % s_action_count; break;
+    case PHASE_TARGET:
+      if (s_target_count > 0) s_target = (s_target + 1) % s_target_count;
+      break;
+    case PHASE_BROWSE: cycle_own_unit(1); break;
+    default: break;
   }
   layer_mark_dirty(s_canvas);
 }
 
 static void up_long_handler(ClickRecognizerRef r, void *context) {
-  if (s_phase == PHASE_MENU) return;
+  if (s_phase != PHASE_BROWSE && s_phase != PHASE_GROUP &&
+      s_phase != PHASE_MOVE   && s_phase != PHASE_TARGET) return;
   s_show_threat = !s_show_threat;
   if (s_show_threat) recompute_threat();
   layer_mark_dirty(s_canvas);
@@ -1229,15 +1505,59 @@ static void down_long_handler(ClickRecognizerRef r, void *context) {
 }
 
 static void select_handler(ClickRecognizerRef r, void *context) {
-  if (s_phase == PHASE_MENU) {
-    if (s_menu == 0) {
+  if (s_phase == PHASE_MAIN) {
+    switch (s_mm_act[s_mm_sel]) {
+      case MM_CONTINUE:
+        s_phase = (s_winner >= 0) ? PHASE_OVER : PHASE_BROWSE;
+        break;
+      case MM_CAMPAIGN:
+        build_level_menu();
+        s_phase = PHASE_LEVELS;
+        break;
+      case MM_SKIRMISH:
+        start_skirmish();
+        save_game();
+        break;
+      case MM_EXIT:
+        window_stack_pop(true);
+        return;
+    }
+    layer_mark_dirty(s_canvas);
+    return;
+  }
+
+  if (s_phase == PHASE_LEVELS) {
+    if (!camp_unlocked(s_lv_sel)) {
+      vibes_short_pulse();                 // still locked
+    } else {
+      start_level(s_camp[s_lv_sel], true);
+      save_game();
+    }
+    layer_mark_dirty(s_canvas);
+    return;
+  }
+
+  if (s_phase == PHASE_PAUSE) {
+    if (s_pause_sel == 0) {
       s_phase = (s_winner >= 0) ? PHASE_OVER : PHASE_BROWSE;
-    } else if (s_menu == 1) {
-      new_game();
+    } else if (s_pause_sel == 1) {
+      start_level(s_level_idx, s_campaign);
+      save_game();
     } else {
       save_game();
-      window_stack_pop(true);
-      return;
+      go_main_menu();
+    }
+    layer_mark_dirty(s_canvas);
+    return;
+  }
+
+  if (s_phase == PHASE_OVER) {
+    if (s_campaign) {
+      build_level_menu();
+      s_phase = PHASE_LEVELS;
+    } else {
+      start_skirmish();
+      save_game();
     }
     layer_mark_dirty(s_canvas);
     return;
@@ -1272,10 +1592,10 @@ static void select_handler(ClickRecognizerRef r, void *context) {
     build_actions(s_selected, s_moved);
 
     if (s_action_count == 1) {
-      finish_action();                                    // nothing to do but wait
+      finish_action();
     } else if (s_action_count == 2 && s_actions[0] == ACT_ATTACK) {
       s_target = 0;
-      s_phase = PHASE_TARGET;                             // keep the quick attack path
+      s_phase = PHASE_TARGET;
     } else {
       s_phase = PHASE_ACTION;
     }
@@ -1300,38 +1620,43 @@ static void select_handler(ClickRecognizerRef r, void *context) {
 }
 
 static void select_long_handler(ClickRecognizerRef r, void *context) {
-  if (s_phase == PHASE_MENU) return;
-
-  if (s_phase == PHASE_OVER) {
-    new_game();
-  } else if (s_phase == PHASE_BROWSE) {
-    if (!all_player_used() && !s_confirm_end) {
-      s_confirm_end = true;
-    } else {
-      begin_enemy_turn();
-    }
+  if (s_phase == PHASE_BROWSE) {
+    if (!all_player_used() && !s_confirm_end) s_confirm_end = true;
+    else                                      begin_enemy_turn();
+    layer_mark_dirty(s_canvas);
   }
-  layer_mark_dirty(s_canvas);
 }
 
-// Back never quits on its own any more. It steps back, or opens the menu.
 static void back_handler(ClickRecognizerRef r, void *context) {
   s_confirm_end = false;
 
-  if (s_phase == PHASE_MENU) {
-    s_phase = (s_winner >= 0) ? PHASE_OVER : PHASE_BROWSE;
-  } else if (s_phase == PHASE_GROUP) {
-    s_selected = -1;
-    s_phase = PHASE_BROWSE;
-  } else if (s_phase == PHASE_MOVE) {
-    s_phase = PHASE_GROUP;
-  } else if (s_phase == PHASE_ACTION || s_phase == PHASE_TARGET) {
-    finish_action();
-  } else if (s_phase == PHASE_ENEMY) {
-    return;
-  } else {
-    s_menu = 0;
-    s_phase = PHASE_MENU;
+  switch (s_phase) {
+    case PHASE_MAIN:
+      window_stack_pop(true);
+      return;
+    case PHASE_LEVELS:
+      go_main_menu();
+      break;
+    case PHASE_PAUSE:
+      s_phase = (s_winner >= 0) ? PHASE_OVER : PHASE_BROWSE;
+      break;
+    case PHASE_GROUP:
+      s_selected = -1;
+      s_phase = PHASE_BROWSE;
+      break;
+    case PHASE_MOVE:
+      s_phase = PHASE_GROUP;
+      break;
+    case PHASE_ACTION:
+    case PHASE_TARGET:
+      finish_action();
+      break;
+    case PHASE_ENEMY:
+      return;
+    default:                       // browse or game over
+      s_pause_sel = 0;
+      s_phase = PHASE_PAUSE;
+      break;
   }
   layer_mark_dirty(s_canvas);
 }
@@ -1361,24 +1686,26 @@ static void window_unload(Window *window) {
 }
 
 static void init(void) {
-  init_sites();
+  load_progress();
+  build_campaign_list();
+  build_level_menu();
 
   if (load_game()) {
     s_selected = -1;
     s_moved = false;
     s_confirm_end = false;
     s_undo_ok = false;
-    if (s_winner >= 0) {
-      s_phase = PHASE_OVER;
-      snap_browse_to_own();
-    } else {
-      s_phase = PHASE_BROWSE;
-      focus_next_unacted(s_unit_count - 1);
-    }
+    s_have_save = (s_winner < 0);
+    if (s_winner < 0) focus_next_unacted(s_unit_count - 1);
+    else              snap_browse_to_own();
     recompute_threat();
   } else {
-    new_game();
+    s_have_save = false;
+    start_level(5, false);
   }
+
+  build_main_menu();
+  s_phase = PHASE_MAIN;
 
   s_window = window_create();
   window_set_click_config_provider(s_window, click_config);
@@ -1390,7 +1717,7 @@ static void init(void) {
 }
 
 static void deinit(void) {
-  save_game();
+  if (s_phase != PHASE_MAIN && s_phase != PHASE_LEVELS) save_game();
   window_destroy(s_window);
 }
 
