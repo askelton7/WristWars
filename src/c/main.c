@@ -2,7 +2,7 @@
 #include <string.h>
 
 // ===========================================================================
-//  WristWars - step 11: artillery rework, terrain-aware AI, denser maps
+//  WristWars - step 12: artillery range 3, skirmish sandbox, five maps
 // ===========================================================================
 
 #define GRID_W    10
@@ -15,9 +15,10 @@
 #define AI_STEP_MS  450
 #define CAPTURE_GOAL 20
 
-#define SAVE_VERSION     6
+#define SAVE_VERSION     7
 #define PERSIST_KEY_SAVE 1
 #define PERSIST_KEY_PROG 2
+#define PERSIST_KEY_SET  3
 
 typedef enum { U_INFANTRY = 0, U_BAZOOKA, U_TANK, U_ARTILLERY } UnitType;
 
@@ -43,6 +44,10 @@ static const Deploy s_dep2[] = { { U_BAZOOKA, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }
 static const Deploy s_dep3[] = { { U_ARTILLERY, 0, 4, 7 }, { U_INFANTRY, 0, 2, 7 }, { U_BAZOOKA, 0, 6, 7 }, { U_INFANTRY, 1, 4, 2 }, { U_INFANTRY, 1, 6, 2 }, { U_TANK, 1, 2, 2 } };
 static const Deploy s_dep4[] = { { U_INFANTRY, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }, { U_BAZOOKA, 0, 1, 7 }, { U_TANK, 0, 3, 8 }, { U_INFANTRY, 1, 8, 1 }, { U_INFANTRY, 1, 7, 1 }, { U_BAZOOKA, 1, 8, 2 }, { U_TANK, 1, 6, 1 } };
 static const Deploy s_dep5[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 }, { U_BAZOOKA, 0, 0, 8 }, { U_TANK, 0, 2, 8 }, { U_ARTILLERY, 0, 1, 7 }, { U_INFANTRY, 1, 9, 0 }, { U_INFANTRY, 1, 8, 0 }, { U_BAZOOKA, 1, 9, 1 }, { U_TANK, 1, 7, 1 }, { U_ARTILLERY, 1, 8, 2 } };
+static const Deploy s_dep7[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 }, { U_BAZOOKA, 0, 2, 9 }, { U_TANK, 0, 0, 8 }, { U_ARTILLERY, 0, 2, 8 }, { U_INFANTRY, 1, 9, 0 }, { U_INFANTRY, 1, 8, 0 }, { U_BAZOOKA, 1, 7, 0 }, { U_TANK, 1, 9, 1 }, { U_ARTILLERY, 1, 7, 1 } };
+static const Deploy s_dep8[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 }, { U_BAZOOKA, 0, 2, 9 }, { U_TANK, 0, 0, 8 }, { U_ARTILLERY, 0, 2, 8 }, { U_INFANTRY, 1, 9, 0 }, { U_INFANTRY, 1, 8, 0 }, { U_BAZOOKA, 1, 7, 0 }, { U_TANK, 1, 9, 1 }, { U_ARTILLERY, 1, 7, 1 } };
+static const Deploy s_dep9[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 }, { U_BAZOOKA, 0, 2, 9 }, { U_TANK, 0, 0, 8 }, { U_ARTILLERY, 0, 2, 8 }, { U_INFANTRY, 1, 9, 0 }, { U_INFANTRY, 1, 8, 0 }, { U_BAZOOKA, 1, 7, 0 }, { U_TANK, 1, 9, 1 }, { U_ARTILLERY, 1, 7, 1 } };
+
 static const Deploy s_dep6[] = { { U_INFANTRY, 0, 0, 9 }, { U_INFANTRY, 0, 1, 9 }, { U_BAZOOKA, 0, 2, 9 }, { U_TANK, 0, 0, 8 }, { U_ARTILLERY, 0, 2, 8 }, { U_INFANTRY, 1, 9, 0 }, { U_INFANTRY, 1, 8, 0 }, { U_BAZOOKA, 1, 7, 0 }, { U_TANK, 1, 9, 1 }, { U_ARTILLERY, 1, 7, 1 } };
 
 static const Level LEVELS[] = {
@@ -85,7 +90,7 @@ static const Level LEVELS[] = {
   { "Shellfire", {
       "..........",
       "..........",
-      "..........",
+      "..F....F..",
       "..FF..FF..",
       ".www..www.",
       "..........",
@@ -130,6 +135,42 @@ static const Level LEVELS[] = {
       ".h..F.....",
       ".........." },
     s_dep6, ARRAY_LENGTH(s_dep6), false, true, "Three lanes. Pick one." },
+  { "The Pass", {
+      "..........",
+      ".c......e.",
+      "......c...",
+      "..MMM.MM..",
+      "M.MM...MM.",
+      ".MM...MM.M",
+      "..M..MMM..",
+      "...c......",
+      ".h......c.",
+      ".........." },
+    s_dep7, ARRAY_LENGTH(s_dep7), false, true, "One road through. Foot goes over." },
+  { "Delta", {
+      "..c.....e.",
+      ".....F....",
+      "..F....c..",
+      "wwww.wwww.",
+      "....F.....",
+      ".c..w..F..",
+      ".wwww.www.",
+      "...F......",
+      ".h.....c..",
+      ".........." },
+    s_dep8, ARRAY_LENGTH(s_dep8), false, true, "Two crossings. Hold one." },
+  { "Open Ground", {
+      "....c...e.",
+      "..F.......",
+      ".....FF...",
+      "...F......",
+      "..c....M..",
+      "..M....c..",
+      "......F...",
+      "...FF.....",
+      ".h...c....",
+      ".........." },
+    s_dep9, ARRAY_LENGTH(s_dep9), false, true, "Nowhere to hide. Armour runs." },
 };
 
 #define LEVEL_COUNT ((int)ARRAY_LENGTH(LEVELS))
@@ -217,7 +258,8 @@ static int site_at(int x, int y) {
 
 // ---- Units ----------------------------------------------------------------
 
-static const char *UNIT_NAMES[] = { "Infantry", "Bazooka", "Tank", "Artillery" };
+static const char *UNIT_NAMES[]  = { "Infantry", "Bazooka", "Tank", "Artillery" };
+static const char *UNIT_SHORT[]  = { "Inf", "Bzk", "Tnk", "Art" };
 static const int   UNIT_MOVE[]  = {  3,   2,   6,   2  };
 static const int   UNIT_VALUE[] = {  1,   2,   3,   3  };
 
@@ -228,6 +270,30 @@ static const int DMG[4][4] = {
   /*Tank*/ {  7,   7,   5,   8 },
   /*Arty*/ {  8,   8,   8,   8 },
 };
+
+// ---- Army presets ---------------------------------------------------------
+// Skirmish maps supply five spawn slots per side; a preset decides what fills
+// them, so any army can be dropped onto any map.
+
+#define ARMY_SIZE   5
+#define ARMY_COUNT  6
+#define ARMY_RANDOM (ARMY_COUNT - 1)
+
+static const char *ARMY_NAMES[ARMY_COUNT] = {
+  "Balanced", "Infantry", "Armoured", "Gunline", "Ambush", "Random",
+};
+
+static const uint8_t ARMY_UNITS[ARMY_COUNT][ARMY_SIZE] = {
+  { U_INFANTRY,  U_INFANTRY, U_BAZOOKA,  U_TANK,     U_ARTILLERY },
+  { U_INFANTRY,  U_INFANTRY, U_INFANTRY, U_INFANTRY, U_BAZOOKA   },
+  { U_TANK,      U_TANK,     U_TANK,     U_INFANTRY, U_INFANTRY  },
+  { U_ARTILLERY, U_ARTILLERY,U_BAZOOKA,  U_INFANTRY, U_INFANTRY  },
+  { U_BAZOOKA,   U_BAZOOKA,  U_BAZOOKA,  U_INFANTRY, U_INFANTRY  },
+  { U_INFANTRY,  U_INFANTRY, U_BAZOOKA,  U_TANK,     U_ARTILLERY },  // rolled
+};
+
+static uint8_t s_army_pick[2] = { 0, 0 };
+static bool    s_use_armies   = false;
 
 typedef struct {
   uint8_t type;
@@ -247,7 +313,7 @@ static int s_lost_enemy  = 0;
 
 static bool is_indirect(UnitType t) { return t == U_ARTILLERY; }
 static int  min_range(UnitType t)   { return is_indirect(t) ? 2 : 1; }
-static int  max_range(UnitType t)   { return is_indirect(t) ? 4 : 1; }
+static int  max_range(UnitType t)   { return is_indirect(t) ? 3 : 1; }
 
 static int abs_i(int v) { return v < 0 ? -v : v; }
 
@@ -261,11 +327,20 @@ static int dist_between(const Unit *a, const Unit *b) {
 
 static void setup_units_from_level(void) {
   const Level *lv = cur();
+  int slot[2] = { 0, 0 };
   s_unit_count = 0;
   for (int i = 0; i < lv->deploy_count && s_unit_count < MAX_UNITS; i++) {
     const Deploy *d = &lv->deploys[i];
     Unit *u = &s_units[s_unit_count++];
     u->type = d->type; u->team = d->team;
+
+    // Skirmish: the map gives the position, the chosen army gives the unit.
+    if (s_use_armies && d->team < 2) {
+      int t = d->team;
+      if (slot[t] < ARMY_SIZE) u->type = ARMY_UNITS[s_army_pick[t]][slot[t]];
+      slot[t]++;
+    }
+
     u->x = d->x; u->y = d->y;
     u->hp = 10; u->acted = false; u->alive = true;
   }
@@ -637,11 +712,36 @@ static uint32_t s_progress = 0;
 static uint8_t  s_camp[LEVEL_COUNT];
 static int      s_camp_count = 0;
 
+static uint8_t s_sk[LEVEL_COUNT];
+static int     s_sk_count = 0;
+
 static void build_campaign_list(void) {
   s_camp_count = 0;
+  s_sk_count   = 0;
   for (int i = 0; i < LEVEL_COUNT; i++) {
     if (LEVELS[i].campaign) s_camp[s_camp_count++] = (uint8_t)i;
+    if (LEVELS[i].skirmish) s_sk[s_sk_count++]     = (uint8_t)i;
   }
+}
+
+// Skirmish setup, remembered between sessions.
+static uint8_t s_set_map     = 0;              // 0 = random, else s_sk index + 1
+static uint8_t s_set_army[2] = { 0, 0 };
+
+static void load_settings(void) {
+  if (!persist_exists(PERSIST_KEY_SET)) return;
+  uint32_t v = (uint32_t)persist_read_int(PERSIST_KEY_SET);
+  uint8_t m = v & 0xff, a0 = (v >> 8) & 0xff, a1 = (v >> 16) & 0xff;
+  if (m <= (uint8_t)s_sk_count) s_set_map = m;
+  if (a0 < ARMY_COUNT) s_set_army[0] = a0;
+  if (a1 < ARMY_COUNT) s_set_army[1] = a1;
+}
+
+static void save_settings(void) {
+  uint32_t v = (uint32_t)s_set_map
+             | ((uint32_t)s_set_army[0] << 8)
+             | ((uint32_t)s_set_army[1] << 16);
+  persist_write_int(PERSIST_KEY_SET, (int)v);
 }
 
 static void load_progress(void) {
@@ -664,7 +764,7 @@ static bool camp_unlocked(int ci) {
 // ---- Game state -----------------------------------------------------------
 
 typedef enum {
-  PHASE_MAIN = 0, PHASE_LEVELS, PHASE_PAUSE,
+  PHASE_MAIN = 0, PHASE_LEVELS, PHASE_SETUP, PHASE_PAUSE,
   PHASE_BROWSE, PHASE_GROUP, PHASE_MOVE, PHASE_ACTION,
   PHASE_TARGET, PHASE_ENEMY, PHASE_OVER,
 } Phase;
@@ -694,6 +794,34 @@ static bool    s_have_save = false;
 
 static char s_lv_label[LEVEL_COUNT][22];
 static int  s_lv_sel = 0;
+
+#define SET_ROWS 4
+static char s_set_label[SET_ROWS][22];
+static int  s_set_sel = 0;
+
+static const char *set_map_name(void) {
+  if (s_set_map == 0) return "Random";
+  return LEVELS[s_sk[s_set_map - 1]].name;
+}
+
+static void build_setup_menu(void) {
+  snprintf(s_set_label[0], sizeof(s_set_label[0]), "Map: %s", set_map_name());
+  snprintf(s_set_label[1], sizeof(s_set_label[0]), "You: %s", ARMY_NAMES[s_set_army[0]]);
+  snprintf(s_set_label[2], sizeof(s_set_label[0]), "Foe: %s", ARMY_NAMES[s_set_army[1]]);
+  snprintf(s_set_label[3], sizeof(s_set_label[0]), "Start");
+}
+
+// "Inf Inf Bzk Tnk Art" for the preset under the cursor.
+static void army_summary(int preset, char *buf, int len) {
+  if (preset == ARMY_RANDOM) { snprintf(buf, len, "rolled at kickoff"); return; }
+  int n = 0;
+  buf[0] = '\0';
+  for (int i = 0; i < ARMY_SIZE; i++) {
+    if (n >= len - 1) break;
+    n += snprintf(buf + n, (size_t)(len - n), "%s%s",
+                  i ? " " : "", UNIT_SHORT[ARMY_UNITS[preset][i]]);
+  }
+}
 
 static const char *PAUSE_ITEMS[] = { "Resume", "Restart", "Main menu" };
 #define PAUSE_COUNT 3
@@ -829,7 +957,8 @@ typedef struct {
   uint8_t  lost_enemy;
   uint8_t  level;
   uint8_t  campaign;
-  uint8_t  pad0, pad1;
+  uint8_t  use_armies;
+  uint8_t  army0, army1;
   Unit     units[MAX_UNITS];
   Site     sites[MAX_SITES];
 } SaveBlob;
@@ -848,6 +977,9 @@ static void save_game(void) {
   b.lost_enemy  = (uint8_t)s_lost_enemy;
   b.level       = (uint8_t)s_level_idx;
   b.campaign    = s_campaign ? 1 : 0;
+  b.use_armies  = s_use_armies ? 1 : 0;
+  b.army0       = s_army_pick[0];
+  b.army1       = s_army_pick[1];
   memcpy(b.units, s_units, sizeof(s_units));
   memcpy(b.sites, s_sites, sizeof(s_sites));
   persist_write_data(PERSIST_KEY_SAVE, &b, sizeof(b));
@@ -864,8 +996,13 @@ static bool load_game(void) {
   if (b.site_count > MAX_SITES) return false;
   if (b.level >= LEVEL_COUNT) return false;
 
+  if (b.army0 >= ARMY_COUNT || b.army1 >= ARMY_COUNT) return false;
+
   s_level_idx   = b.level;
   s_campaign    = (b.campaign != 0);
+  s_use_armies  = (b.use_armies != 0);
+  s_army_pick[0] = b.army0;
+  s_army_pick[1] = b.army1;
   s_unit_count  = b.unit_count;
   s_site_count  = b.site_count;
   memcpy(s_units, b.units, sizeof(s_units));
@@ -1062,12 +1199,19 @@ static void start_level(int idx, bool campaign) {
 }
 
 static void start_skirmish(void) {
-  uint8_t pool[LEVEL_COUNT];
-  int n = 0;
-  for (int i = 0; i < LEVEL_COUNT; i++) if (LEVELS[i].skirmish) pool[n++] = (uint8_t)i;
-  if (n == 0) { start_level(0, false); return; }
-  int pick = pool[(int)(time(NULL) % (unsigned)n)];
-  start_level(pick, false);
+  if (s_sk_count == 0) { s_use_armies = false; start_level(0, false); return; }
+
+  unsigned seed = (unsigned)time(NULL);
+  int map = (s_set_map == 0) ? s_sk[seed % (unsigned)s_sk_count]
+                             : s_sk[s_set_map - 1];
+
+  for (int t = 0; t < 2; t++) {
+    int a = s_set_army[t];
+    if (a == ARMY_RANDOM) a = (int)((seed + (unsigned)t * 7u) % (unsigned)ARMY_RANDOM);
+    s_army_pick[t] = (uint8_t)a;
+  }
+  s_use_armies = true;
+  start_level(map, false);
 }
 
 // ---- Drawing --------------------------------------------------------------
@@ -1263,6 +1407,33 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     draw_menu_list(ctx, GRect(24, 64, bounds.size.w - 48, 0), 32,
                    (const char *)s_mm_label, (int)sizeof(s_mm_label[0]),
                    s_mm_count, s_mm_sel, FONT_KEY_GOTHIC_18);
+    return;
+  }
+
+  if (s_phase == PHASE_SETUP) {
+    static char s_sum[40];
+    graphics_context_set_text_color(ctx, GColorYellow);
+    graphics_draw_text(ctx, "Skirmish", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                       GRect(0, 6, bounds.size.w, 22),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    draw_menu_list(ctx, GRect(8, 34, bounds.size.w - 16, 0), 28,
+                   (const char *)s_set_label, (int)sizeof(s_set_label[0]),
+                   SET_ROWS, s_set_sel, FONT_KEY_GOTHIC_18);
+
+    if (s_set_sel == 0) {
+      snprintf(s_sum, sizeof(s_sum), "%s",
+               s_set_map == 0 ? "any of the skirmish maps"
+                              : LEVELS[s_sk[s_set_map - 1]].hint);
+    } else if (s_set_sel == SET_ROWS - 1) {
+      snprintf(s_sum, sizeof(s_sum), "Select to deploy");
+    } else {
+      army_summary(s_set_army[s_set_sel - 1], s_sum, sizeof(s_sum));
+    }
+
+    graphics_context_set_text_color(ctx, GColorLightGray);
+    graphics_draw_text(ctx, s_sum, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(6, bounds.size.h - 38, bounds.size.w - 12, 34),
+                       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
     return;
   }
 
@@ -1497,6 +1668,7 @@ static void up_handler(ClickRecognizerRef r, void *context) {
   switch (s_phase) {
     case PHASE_MAIN:   s_mm_sel = (s_mm_sel + s_mm_count - 1) % s_mm_count; break;
     case PHASE_LEVELS: s_lv_sel = (s_lv_sel + s_camp_count - 1) % s_camp_count; break;
+    case PHASE_SETUP:  s_set_sel = (s_set_sel + SET_ROWS - 1) % SET_ROWS; break;
     case PHASE_PAUSE:  s_pause_sel = (s_pause_sel + PAUSE_COUNT - 1) % PAUSE_COUNT; break;
     case PHASE_GROUP:
       if (s_group_count > 0) s_group = (s_group + s_group_count - 1) % s_group_count;
@@ -1519,6 +1691,7 @@ static void down_handler(ClickRecognizerRef r, void *context) {
   switch (s_phase) {
     case PHASE_MAIN:   s_mm_sel = (s_mm_sel + 1) % s_mm_count; break;
     case PHASE_LEVELS: s_lv_sel = (s_lv_sel + 1) % s_camp_count; break;
+    case PHASE_SETUP:  s_set_sel = (s_set_sel + 1) % SET_ROWS; break;
     case PHASE_PAUSE:  s_pause_sel = (s_pause_sel + 1) % PAUSE_COUNT; break;
     case PHASE_GROUP:
       if (s_group_count > 0) s_group = (s_group + 1) % s_group_count;
@@ -1572,8 +1745,8 @@ static void select_handler(ClickRecognizerRef r, void *context) {
         s_phase = PHASE_LEVELS;
         break;
       case MM_SKIRMISH:
-        start_skirmish();
-        save_game();
+        build_setup_menu();
+        s_phase = PHASE_SETUP;
         break;
       case MM_EXIT:
         window_stack_pop(true);
@@ -1583,10 +1756,29 @@ static void select_handler(ClickRecognizerRef r, void *context) {
     return;
   }
 
+  if (s_phase == PHASE_SETUP) {
+    if (s_set_sel == 0) {
+      s_set_map = (uint8_t)((s_set_map + 1) % (s_sk_count + 1));
+    } else if (s_set_sel < SET_ROWS - 1) {
+      int t = s_set_sel - 1;
+      s_set_army[t] = (uint8_t)((s_set_army[t] + 1) % ARMY_COUNT);
+    } else {
+      save_settings();
+      start_skirmish();
+      save_game();
+      layer_mark_dirty(s_canvas);
+      return;
+    }
+    build_setup_menu();
+    layer_mark_dirty(s_canvas);
+    return;
+  }
+
   if (s_phase == PHASE_LEVELS) {
     if (!camp_unlocked(s_lv_sel)) {
       vibes_short_pulse();                 // still locked
     } else {
+      s_use_armies = false;                // campaign keeps its scripted forces
       start_level(s_camp[s_lv_sel], true);
       save_game();
     }
@@ -1613,8 +1805,8 @@ static void select_handler(ClickRecognizerRef r, void *context) {
       build_level_menu();
       s_phase = PHASE_LEVELS;
     } else {
-      start_skirmish();
-      save_game();
+      build_setup_menu();                  // back to the sandbox, not a rerun
+      s_phase = PHASE_SETUP;
     }
     layer_mark_dirty(s_canvas);
     return;
@@ -1701,6 +1893,7 @@ static void back_handler(ClickRecognizerRef r, void *context) {
       window_stack_pop(true);
       return;
     case PHASE_LEVELS:
+    case PHASE_SETUP:
       go_main_menu();
       break;
     case PHASE_PAUSE:
@@ -1760,6 +1953,8 @@ static void init(void) {
   load_progress();
   build_campaign_list();
   build_level_menu();
+  load_settings();
+  build_setup_menu();
 
   if (load_game()) {
     s_selected = -1;
@@ -1788,7 +1983,9 @@ static void init(void) {
 }
 
 static void deinit(void) {
-  if (s_phase != PHASE_MAIN && s_phase != PHASE_LEVELS) save_game();
+  if (s_phase != PHASE_MAIN && s_phase != PHASE_LEVELS && s_phase != PHASE_SETUP) {
+    save_game();
+  }
   window_destroy(s_window);
 }
 
