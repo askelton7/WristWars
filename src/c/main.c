@@ -2,20 +2,20 @@
 #include <string.h>
 
 // ===========================================================================
-//  WristWars - step 12: artillery range 3, skirmish sandbox, five maps
+//  WristWars - step 13: cities removed, softer damage curve, clearer reads
 // ===========================================================================
 
 #define GRID_W    10
 #define GRID_H    10
 #define TILE      18
 #define MAX_UNITS 16
-#define MAX_SITES 12
+#define MAX_SITES 2
 #define MAX_REACH (GRID_W * GRID_H)
 #define UNREACHABLE 255
 #define AI_STEP_MS  450
 #define CAPTURE_GOAL 20
 
-#define SAVE_VERSION     7
+#define SAVE_VERSION     8
 #define PERSIST_KEY_SAVE 1
 #define PERSIST_KEY_PROG 2
 #define PERSIST_KEY_SET  3
@@ -36,7 +36,7 @@ typedef struct {
 
 // ---- Maps -----------------------------------------------------------------
 //   .  = plains     F = forest     M = mountain    w = water
-//   c  = city       h = your HQ    e = enemy HQ
+//   h  = your HQ    e = enemy HQ
 
 static const Deploy s_dep0[] = { { U_INFANTRY, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }, { U_INFANTRY, 1, 7, 2 } };
 static const Deploy s_dep1[] = { { U_INFANTRY, 0, 1, 8 }, { U_INFANTRY, 0, 2, 8 }, { U_BAZOOKA, 0, 1, 7 }, { U_INFANTRY, 1, 3, 2 }, { U_INFANTRY, 1, 4, 3 } };
@@ -99,76 +99,76 @@ static const Level LEVELS[] = {
       "....M.....",
       ".........." },
     s_dep3, ARRAY_LENGTH(s_dep3), true, false, "Artillery hits hardest standing still." },
-  { "Take the City", {
+  { "The Objective", {
       "..........",
-      "..c....c..",
-      "...F.F....",
+      "......F..e",
+      "...F...F..",
       "..FF...MM.",
       "....FF....",
       "..MM...FF.",
       "....F.....",
-      "..c....c..",
-      "..........",
+      "..F....F..",
+      "h.........",
       ".........." },
-    s_dep4, ARRAY_LENGTH(s_dep4), true, false, "Cities heal. Infantry capture." },
+    s_dep4, ARRAY_LENGTH(s_dep4), true, false, "Only infantry capture. Two turns on their HQ." },
   { "Headquarters", {
       ".......F..",
-      "..c.....e.",
-      "...cM.F...",
+      "..F.....e.",
+      "....M.F...",
       ".F.ww...F.",
-      "..Mwww.c.F",
-      "F.c.wwwM..",
+      "..Mwww.F.F",
+      "F...wwwM..",
       ".F...ww.F.",
-      "...F.Mc...",
-      ".h.....c..",
+      "...F.MF...",
+      ".h........",
       "..F......." },
     s_dep5, ARRAY_LENGTH(s_dep5), true, true, "Take their HQ, or wipe them out." },
   { "Crossroads", {
       "..........",
       ".....F..e.",
-      ".F...c....",
-      "..cw...F..",
-      "M..wM.w.c.",
-      ".c.w.Mw..M",
-      "..F...wc..",
-      "....c...F.",
+      ".F...F....",
+      "..Fw...F..",
+      "M..wM.w...",
+      "...w.Mw..M",
+      "..F...w...",
+      "....F...F.",
       ".h..F.....",
       ".........." },
     s_dep6, ARRAY_LENGTH(s_dep6), false, true, "Three lanes. Pick one." },
   { "The Pass", {
       "..........",
-      ".c......e.",
-      "......c...",
+      ".F......e.",
+      "......F...",
       "..MMM.MM..",
       "M.MM...MM.",
       ".MM...MM.M",
       "..M..MMM..",
-      "...c......",
-      ".h......c.",
+      "...F......",
+      ".h........",
       ".........." },
     s_dep7, ARRAY_LENGTH(s_dep7), false, true, "One road through. Foot goes over." },
   { "Delta", {
-      "..c.....e.",
+      "..F.....e.",
       ".....F....",
-      "..F....c..",
+      "..F....F..",
       "wwww.wwww.",
       "....F.....",
-      ".c..w..F..",
+      "....w..F..",
       ".wwww.www.",
       "...F......",
-      ".h.....c..",
+      ".h........",
       ".........." },
     s_dep8, ARRAY_LENGTH(s_dep8), false, true, "Two crossings. Hold one." },
   { "Open Ground", {
-      "....c...e.",
+      "........e.",
       "..F.......",
       ".....FF...",
       "...F......",
-      "..c....M..",
-      "..M....c..",
+      ".......M..",
+      "..M....F..",
       "......F...",
       "...FF.....",
-      ".h...c....",
+      ".h........",
       ".........." },
     s_dep9, ARRAY_LENGTH(s_dep9), false, true, "Nowhere to hide. Armour runs." },
 };
@@ -183,20 +183,19 @@ static const Level *cur(void) { return &LEVELS[s_level_idx]; }
 // ---- Terrain --------------------------------------------------------------
 
 typedef enum {
-  T_PLAINS = 0, T_FOREST, T_MOUNTAIN, T_WATER, T_CITY, T_HQ
+  T_PLAINS = 0, T_FOREST, T_MOUNTAIN, T_WATER, T_HQ
 } Terrain;
 
 static const char *TERRAIN_NAMES[] = {
-  "Plains", "Forest", "Mountain", "Sea", "City", "HQ"
+  "Plains", "Forest", "Mountain", "Sea", "HQ"
 };
-static const int TERRAIN_DEF[] = { 0, 1, 2, 0, 1, 2 };
+static const int TERRAIN_DEF[] = { 0, 1, 2, 0, 2 };
 
 static Terrain terrain_at(int x, int y) {
   switch (cur()->rows[y][x]) {
     case 'F': return T_FOREST;
     case 'M': return T_MOUNTAIN;
     case 'w': return T_WATER;
-    case 'c': return T_CITY;
     case 'h': case 'e': return T_HQ;
     default:  return T_PLAINS;
   }
@@ -207,7 +206,6 @@ static GColor terrain_color(Terrain t) {
     case T_FOREST:   return GColorDarkGreen;
     case T_MOUNTAIN: return GColorWindsorTan;
     case T_WATER:    return GColorBlueMoon;
-    case T_CITY:     return GColorLightGray;
     case T_HQ:       return GColorDarkGray;
     default:         return GColorMintGreen;
   }
@@ -215,12 +213,13 @@ static GColor terrain_color(Terrain t) {
 
 // ---- Capturable sites -----------------------------------------------------
 
-#define SITE_CITY 0
-#define SITE_HQ   1
 #define OWNER_NEUTRAL 2
 
+// Only HQs are capturable now. Cities are gone: without an economy or unit
+// production there was nothing for them to pay out, and a heal tile rewarded
+// standing still in a game built on pressure.
 typedef struct {
-  uint8_t x, y, kind, owner, progress, cap_team, home;
+  uint8_t x, y, owner, progress, cap_team, home;
 } Site;
 
 static Site s_sites[MAX_SITES];
@@ -231,20 +230,15 @@ static void init_sites(void) {
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
       char c = cur()->rows[y][x];
-      if (c != 'c' && c != 'h' && c != 'e') continue;
+      if (c != 'h' && c != 'e') continue;
       if (s_site_count >= MAX_SITES) continue;
 
       Site *s = &s_sites[s_site_count++];
       s->x = x; s->y = y;
       s->progress = 0;
       s->cap_team = OWNER_NEUTRAL;
-      if (c == 'c') {
-        s->kind = SITE_CITY; s->owner = OWNER_NEUTRAL; s->home = OWNER_NEUTRAL;
-      } else {
-        s->kind = SITE_HQ;
-        s->owner = (c == 'h') ? 0 : 1;
-        s->home  = s->owner;
-      }
+      s->owner = (c == 'h') ? 0 : 1;
+      s->home  = s->owner;
     }
   }
 }
@@ -372,10 +366,12 @@ static bool can_capture_here(int ui) {
 
 // Indirect fire loses 40% if the gun moved this turn. Everything else
 // ignores the flag, so the rest of the game is unchanged.
+// Health still drives damage, but on a flatter curve: a 3 HP unit hits at 53%
+// rather than 30%, so wounded units stay worth using and a lead snowballs less.
 static int damage_from(const Unit *att, const Unit *def, bool moved) {
   int base = DMG[att->type][def->type];
   if (base <= 0) return 0;
-  int dmg = base * att->hp / 10;
+  int dmg = base * (att->hp + 5) / 15;
   int d   = TERRAIN_DEF[terrain_at(def->x, def->y)];
   dmg = dmg * (10 - 2 * d) / 10;
   if (moved && is_indirect((UnitType)att->type)) dmg = dmg * 6 / 10;
@@ -870,18 +866,23 @@ static void build_level_menu(void) {
   if (s_lv_sel >= s_camp_count) s_lv_sel = 0;
 }
 
+#define WIN_NONE 0
+#define WIN_HQ   1
+#define WIN_ROUT 2
+static int s_win_reason = WIN_NONE;
+
 static void check_game_over(void) {
   for (int i = 0; i < s_site_count; i++) {
-    if (s_sites[i].kind != SITE_HQ) continue;
     if (s_sites[i].owner != s_sites[i].home) {
+      s_win_reason = WIN_HQ;
       s_winner = s_sites[i].owner;
       s_phase = PHASE_OVER;
       break;
     }
   }
   if (s_phase != PHASE_OVER) {
-    if (count_alive(1) == 0)      { s_winner = 0; s_phase = PHASE_OVER; }
-    else if (count_alive(0) == 0) { s_winner = 1; s_phase = PHASE_OVER; }
+    if (count_alive(1) == 0)      { s_win_reason = WIN_ROUT; s_winner = 0; s_phase = PHASE_OVER; }
+    else if (count_alive(0) == 0) { s_win_reason = WIN_ROUT; s_winner = 1; s_phase = PHASE_OVER; }
   }
 
   if (s_phase == PHASE_OVER && s_winner == 0 && s_campaign &&
@@ -934,15 +935,7 @@ static void turn_upkeep(int team) {
       s->cap_team = OWNER_NEUTRAL;
     }
   }
-  for (int i = 0; i < s_unit_count; i++) {
-    Unit *u = &s_units[i];
-    if (!u->alive || u->team != team || u->hp >= 10) continue;
-    int si = site_at(u->x, u->y);
-    if (si >= 0 && s_sites[si].owner == team) {
-      u->hp += 3;
-      if (u->hp > 10) u->hp = 10;
-    }
-  }
+  (void)team;              // nothing heals any more; damage is permanent
 }
 
 // ---- Save / restore -------------------------------------------------------
@@ -1029,6 +1022,19 @@ static int nearest_foe_dist(int x, int y, int team) {
   return best;
 }
 
+// Distance to an HQ this team could capture, or -1 if there is none. Without
+// cities the HQ is the only prize left, so infantry need to feel its pull or
+// the win condition never comes under threat.
+static int nearest_prize_dist(int x, int y, int team) {
+  int best = -1;
+  for (int i = 0; i < s_site_count; i++) {
+    if (s_sites[i].owner == team) continue;
+    int d = dist_xy(x, y, s_sites[i].x, s_sites[i].y);
+    if (best < 0 || d < best) best = d;
+  }
+  return best;
+}
+
 static void ai_act(int ui) {
   Unit *u = &s_units[ui];
   int home_x = u->x, home_y = u->y;
@@ -1086,13 +1092,8 @@ static void ai_act(int ui) {
     int si = site_at(x, y);
     if (si >= 0 && u->type == U_INFANTRY && s_sites[si].owner != u->team) {
       Site *s = &s_sites[si];
-      int score;
-      if (s->kind == SITE_HQ) {
-        bool finishes = (s->cap_team == u->team && s->progress + u->hp >= CAPTURE_GOAL);
-        score = finishes ? 6000 : 2600;
-      } else {
-        score = 850 + s->progress * 8;
-      }
+      bool finishes = (s->cap_team == u->team && s->progress + u->hp >= CAPTURE_GOAL);
+      int score = finishes ? 6000 : 2600;
       score += def_bonus;
       if (score > best_score) {
         best_score = score; best_x = x; best_y = y;
@@ -1101,12 +1102,16 @@ static void ai_act(int ui) {
     }
 
     // No shot from here: walk toward the fight, but pay real attention to cover.
-    // Guns instead hold a standoff distance in the middle of their range band.
+    // Guns instead hold a standoff distance in the middle of their range band,
+    // and infantry keep one eye on the HQ they could actually take.
     int cover = TERRAIN_DEF[terrain_at(x, y)] * 12;
     int approach;
     if (is_indirect(u->type)) {
       int ideal = (min_range(u->type) + max_range(u->type)) / 2;
       approach = -abs_i(nearest_foe_dist(x, y, u->team) - ideal) * 12 + cover;
+    } else if (u->type == U_INFANTRY && nearest_prize_dist(x, y, u->team) >= 0) {
+      approach = -(nearest_foe_dist(x, y, u->team) * 5
+                 + nearest_prize_dist(x, y, u->team) * 5) + cover;
     } else {
       approach = -nearest_foe_dist(x, y, u->team) * 10 + cover;
     }
@@ -1189,6 +1194,7 @@ static void start_level(int idx, bool campaign) {
   s_lost_player = 0;
   s_lost_enemy = 0;
   s_winner = -1;
+  s_win_reason = WIN_NONE;
   s_selected = -1;
   s_moved = false;
   s_confirm_end = false;
@@ -1258,12 +1264,10 @@ static void draw_site_flag(GContext *ctx, const Site *s, int px, int py) {
   graphics_context_set_stroke_color(ctx, GColorBlack);
   graphics_draw_rect(ctx, GRect(pole + 1, py + 3, 7, 5));
 
-  if (s->kind == SITE_HQ) {
-    graphics_context_set_fill_color(ctx, owner_color(s->owner));
-    graphics_fill_rect(ctx, GRect(pole + 1, py + 9, 5, 3), 0, GCornerNone);
-    graphics_context_set_stroke_color(ctx, GColorBlack);
-    graphics_draw_rect(ctx, GRect(pole + 1, py + 9, 5, 3));
-  }
+  graphics_context_set_fill_color(ctx, owner_color(s->owner));
+  graphics_fill_rect(ctx, GRect(pole + 1, py + 9, 5, 3), 0, GCornerNone);
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_draw_rect(ctx, GRect(pole + 1, py + 9, 5, 3));
 }
 
 // Silhouettes instead of letters. Kept inside py+3..py+11 so the health bar
@@ -1529,11 +1533,16 @@ static void canvas_update(Layer *layer, GContext *ctx) {
   static char s_line2[44];
   static char s_tile[28];
   int top = oy + GRID_H * TILE;
+  bool warn = false;
 
   if (s_phase == PHASE_OVER) {
+    const char *how = "";
+    if (s_win_reason == WIN_HQ)   how = (s_winner == 0) ? "HQ taken" : "HQ lost";
+    else if (s_win_reason == WIN_ROUT) how = (s_winner == 0) ? "wiped them out"
+                                                             : "wiped out";
     snprintf(s_line1, sizeof(s_line1), "%s", s_winner == 0 ? "You win!" : "Defeated");
-    snprintf(s_line2, sizeof(s_line2), "T%d  lost %d  killed %d",
-             s_turn, s_lost_player, s_lost_enemy);
+    snprintf(s_line2, sizeof(s_line2), "%s  T%d  -%d +%d",
+             how, s_turn, s_lost_player, s_lost_enemy);
 
   } else if (s_phase == PHASE_ENEMY) {
     snprintf(s_line1, sizeof(s_line1), "Enemy turn");
@@ -1559,7 +1568,8 @@ static void canvas_update(Layer *layer, GContext *ctx) {
     int back = can_counter(d, a) ? compute_damage(d, a) : 0;
     tile_label(d->x, d->y, s_tile, sizeof(s_tile));
     snprintf(s_line1, sizeof(s_line1), "%s  -%d / -%d", UNIT_NAMES[d->type], out, back);
-    snprintf(s_line2, sizeof(s_line2), "%s%s", s_tile, weak ? "  moved -40%" : "");
+    snprintf(s_line2, sizeof(s_line2), "%s%s%s",
+             out >= d->hp ? "KILL  " : "", s_tile, weak ? "  -40%" : "");
 
   } else if (s_phase == PHASE_GROUP) {
     int g = s_group_count > 0 ? s_groups[s_group] : GRP_STAY;
@@ -1587,6 +1597,16 @@ static void canvas_update(Layer *layer, GContext *ctx) {
              s_cost[cy][cx], s_dest + 1, s_dest_count);
 
   } else {
+    // Losing the HQ without noticing is the worst way to lose, so it outranks
+    // everything else this line could say.
+    int falling = -1;
+    for (int i = 0; i < s_site_count; i++) {
+      if (s_sites[i].home == 0 && s_sites[i].owner == 0 &&
+          s_sites[i].cap_team == 1 && s_sites[i].progress > 0) {
+        falling = i; break;
+      }
+    }
+
     Unit *u = &s_units[s_browse];
     if (is_indirect((UnitType)u->type)) {
       snprintf(s_line1, sizeof(s_line1), "%s %d R%d-%d%s",
@@ -1597,7 +1617,11 @@ static void canvas_update(Layer *layer, GContext *ctx) {
       snprintf(s_line1, sizeof(s_line1), "%s %d%s",
                UNIT_NAMES[u->type], u->hp, u->acted ? " used" : "");
     }
-    if (s_confirm_end) {
+    if (falling >= 0) {
+      warn = true;
+      snprintf(s_line2, sizeof(s_line2), "YOUR HQ FALLING  %d/%d",
+               s_sites[falling].progress, CAPTURE_GOAL);
+    } else if (s_confirm_end) {
       snprintf(s_line2, sizeof(s_line2), "Hold Select again to end");
     } else if (s_turn == 1) {
       snprintf(s_line2, sizeof(s_line2), "%s", cur()->hint);
@@ -1614,7 +1638,8 @@ static void canvas_update(Layer *layer, GContext *ctx) {
                      GRect(0, top, bounds.size.w, 22),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
-  graphics_context_set_text_color(ctx, s_confirm_end ? GColorIcterine : GColorLightGray);
+  graphics_context_set_text_color(ctx,
+      (warn || s_confirm_end) ? GColorIcterine : GColorLightGray);
   graphics_draw_text(ctx, s_line2, fonts_get_system_font(FONT_KEY_GOTHIC_14),
                      GRect(0, top + 21, bounds.size.w, 18),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
