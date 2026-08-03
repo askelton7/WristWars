@@ -2,7 +2,7 @@
 #include <string.h>
 
 // ===========================================================================
-//  WristWars - step 13: cities removed, softer damage curve, clearer reads
+//  WristWars - step 14: 20 HP units, retuned curve, longer engagements
 // ===========================================================================
 
 #define GRID_W    10
@@ -13,9 +13,10 @@
 #define MAX_REACH (GRID_W * GRID_H)
 #define UNREACHABLE 255
 #define AI_STEP_MS  450
-#define CAPTURE_GOAL 20
+#define UNIT_HP      20     // more steps between full and dead
+#define CAPTURE_GOAL 30     // two turns for a healthy infantry, three for a hurt one
 
-#define SAVE_VERSION     8
+#define SAVE_VERSION     9
 #define PERSIST_KEY_SAVE 1
 #define PERSIST_KEY_PROG 2
 #define PERSIST_KEY_SET  3
@@ -336,7 +337,7 @@ static void setup_units_from_level(void) {
     }
 
     u->x = d->x; u->y = d->y;
-    u->hp = 10; u->acted = false; u->alive = true;
+    u->hp = UNIT_HP; u->acted = false; u->alive = true;
   }
 }
 
@@ -366,12 +367,12 @@ static bool can_capture_here(int ui) {
 
 // Indirect fire loses 40% if the gun moved this turn. Everything else
 // ignores the flag, so the rest of the game is unchanged.
-// Health still drives damage, but on a flatter curve: a 3 HP unit hits at 53%
-// rather than 30%, so wounded units stay worth using and a lead snowballs less.
+// Health still drives damage, but not linearly: a half-dead unit hits at 60%
+// rather than 50%, so chip damage matters and a lead snowballs less hard.
 static int damage_from(const Unit *att, const Unit *def, bool moved) {
   int base = DMG[att->type][def->type];
   if (base <= 0) return 0;
-  int dmg = base * (att->hp + 5) / 15;
+  int dmg = base * (att->hp + UNIT_HP / 4) / (UNIT_HP * 5 / 4);
   int d   = TERRAIN_DEF[terrain_at(def->x, def->y)];
   dmg = dmg * (10 - 2 * d) / 10;
   if (moved && is_indirect((UnitType)att->type)) dmg = dmg * 6 / 10;
@@ -1330,8 +1331,8 @@ static void draw_unit(GContext *ctx, int ui, int ox, int oy) {
 
   draw_unit_icon(ctx, (UnitType)u->type, px, py, ink);
 
-  if (u->hp < 10) {
-    int w = (TILE - 8) * u->hp / 10;
+  if (u->hp < UNIT_HP) {
+    int w = (TILE - 8) * u->hp / UNIT_HP;
     graphics_context_set_fill_color(ctx, GColorBlack);
     graphics_fill_rect(ctx, GRect(px + 4, py + TILE - 6, TILE - 8, 3), 0, GCornerNone);
     graphics_context_set_fill_color(ctx, GColorIcterine);
